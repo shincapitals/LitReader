@@ -48,6 +48,7 @@ import {
   signInWithGoogle, 
   logout, 
   db, 
+  storage,
   handleFirestoreError, 
   OperationType 
 } from './firebase';
@@ -63,6 +64,7 @@ import {
   deleteDoc,
   getDocs
 } from 'firebase/firestore';
+import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
 
 import { cn } from './lib/utils';
 import { HistoryItem } from './types';
@@ -162,6 +164,7 @@ export default function App() {
   const [readingHistory, setReadingHistory] = useState<HistoryItem[]>([]);
   const [savedLibrary, setSavedLibrary] = useState<SavedFile[]>([]);
   const [isSaving, setIsSaving] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
 
   // AI Features state
   const [translatedText, setTranslatedText] = useState<string | null>(null);
@@ -170,6 +173,8 @@ export default function App() {
   const [isSummarizing, setIsSummarizing] = useState(false);
   const [aiMode, setAiMode] = useState<'translation' | 'summary' | 'reading'>('translation');
   const [isAiPanelOpen, setIsAiPanelOpen] = useState(false);
+  const [aiPanelSize, setAiPanelSize] = useState({ width: 600, height: 500 });
+  const [isResizing, setIsResizing] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [isAiPanelMinimized, setIsAiPanelMinimized] = useState(false);
@@ -618,9 +623,15 @@ export default function App() {
       };
       await saveFile(savedFile);
       
-      // Sync to Firestore if logged in
+      // Sync to Firestore and Storage if logged in
       if (user) {
         const { data: _, ...metadata } = savedFile;
+        
+        // Upload to Storage
+        const fileRef = ref(storage, `users/${user.uid}/files/${persistenceKey}`);
+        await uploadBytes(fileRef, file);
+        
+        // Save metadata to Firestore
         await setDoc(doc(db, 'users', user.uid, 'files', persistenceKey), {
           ...metadata,
           ownerUid: user.uid
@@ -639,9 +650,15 @@ export default function App() {
     try {
       await deleteFile(id);
       
-      // Sync to Firestore if logged in
+      // Sync to Firestore and Storage if logged in
       if (user) {
         await deleteDoc(doc(db, 'users', user.uid, 'files', id));
+        try {
+          const fileRef = ref(storage, `users/${user.uid}/files/${id}`);
+          await deleteObject(fileRef);
+        } catch (storageErr) {
+          console.error("Failed to delete from storage:", storageErr);
+        }
       }
       
       setReadingHistory(prev => {
@@ -652,6 +669,44 @@ export default function App() {
       await loadLibrary();
     } catch (err) {
       console.error("Failed to delete from library:", err);
+    }
+  };
+
+  const downloadFromCloud = async (saved: SavedFile) => {
+    if (!user) {
+      alert("Vui lòng đăng nhập để tải file từ Cloud.");
+      return;
+    }
+    
+    try {
+      setIsDownloading(true);
+      const fileRef = ref(storage, `users/${user.uid}/files/${saved.id}`);
+      const url = await getDownloadURL(fileRef);
+      
+      // Fetch the actual file data
+      const response = await fetch(url);
+      const blob = await response.blob();
+      
+      // Create a File object
+      const downloadedFile = new File([blob], saved.name, { type: 'application/pdf' });
+      
+      // Save it locally to IndexedDB
+      const newSavedFile = {
+        ...saved,
+        data: downloadedFile
+      };
+      await saveFile(newSavedFile);
+      
+      // Update local state
+      setSavedLibrary(prev => prev.map(f => f.id === saved.id ? newSavedFile : f));
+      
+      // Load it
+      await loadFromLibrary(newSavedFile);
+    } catch (err) {
+      console.error("Failed to download from cloud:", err);
+      alert("Không thể tải file từ Cloud. Có thể file đã bị xóa hoặc lỗi mạng.");
+    } finally {
+      setIsDownloading(false);
     }
   };
 
@@ -674,7 +729,20 @@ export default function App() {
 
   const handleOpenFromHistory = async (item: HistoryItem) => {
     try {
-      const savedFile = await getFile(item.id);
+      let savedFile = await getFile(item.id);
+      
+      // If not in local DB, check if it's a cloud file
+      if (!savedFile) {
+        const cloudFile = savedLibrary.find(f => f.id === item.id);
+        if (cloudFile) {
+          await downloadFromCloud(cloudFile);
+          setTimeout(() => {
+            setPageNumber(item.lastReadPage);
+          }, 100);
+          return;
+        }
+      }
+
       if (savedFile) {
         await loadFromLibrary(savedFile);
         // Explicitly set page number after loading to ensure it's not overwritten
@@ -1210,6 +1278,65 @@ export default function App() {
     }
   }, [pageNumber, isContinuousReading, translatedText, summaryText, isTranslating, isSummarizing, file, isAiPanelOpen, aiMode, translatePage, summarizePage]);
 
+  // Resize logic for AI Panel
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent | TouchEvent) => {
+      if (!isResizing) return;
+      
+      const clientX = 'touches' in e ? e.touches[0].clientX : e.clientX;
+      const clientY = 'touches' in e ? e.touches[0].clientY : e.clientY;
+      
+      // Calculate new width and height based on mouse position
+      // Panel is anchored at bottom-right (bottom-28, right-8 on desktop)
+      // bottom-28 = 7rem = 112px
+      // right-8 = 2rem = 32px
+      
+      const rightEdge = window.innerWidth - 32;
+      const bottomEdge = window.innerHeight - 112;
+      
+      let newWidth = rightEdge - clientX;
+      let newHeight = bottomEdge - clientY;
+      
+      // Snap to grid (50px increments)
+      const snapGrid = 50;
+      newWidth = Math.round(newWidth / snapGrid) * snapGrid;
+      newHeight = Math.round(newHeight / snapGrid) * snapGrid;
+      
+      // Min/Max constraints
+      newWidth = Math.max(300, Math.min(newWidth, window.innerWidth - 64));
+      newHeight = Math.max(300, Math.min(newHeight, window.innerHeight - 150));
+      
+      setAiPanelSize({ width: newWidth, height: newHeight });
+    };
+
+    const handleMouseUp = () => {
+      setIsResizing(false);
+    };
+
+    if (isResizing) {
+      window.addEventListener('mousemove', handleMouseMove);
+      window.addEventListener('touchmove', handleMouseMove);
+      window.addEventListener('mouseup', handleMouseUp);
+      window.addEventListener('touchend', handleMouseUp);
+      
+      // Add a class to body to prevent text selection while resizing
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = 'nwse-resize';
+    } else {
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    }
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('touchmove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      window.removeEventListener('touchend', handleMouseUp);
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    };
+  }, [isResizing]);
+
   if (!file) {
     return (
       <div className={cn("min-h-screen bg-paper flex flex-col items-center justify-center p-6 overflow-hidden relative transition-colors duration-500", fontFamily, !isDarkMode && "light")}>
@@ -1257,7 +1384,13 @@ export default function App() {
                     {savedLibrary.slice(0, 2).map(saved => (
                       <button 
                         key={saved.id} 
-                        onClick={() => loadFromLibrary(saved)}
+                        onClick={() => {
+                          if (saved.data) {
+                            loadFromLibrary(saved);
+                          } else {
+                            downloadFromCloud(saved);
+                          }
+                        }}
                         className="flex items-center justify-between p-3 bg-paper/50 rounded-xl border border-ink/5 hover:border-accent/30 hover:bg-accent/5 transition-all text-left w-full group"
                       >
                         <span className="text-xs font-bold truncate max-w-[160px] group-hover:text-accent transition-colors">{saved.name}</span>
@@ -1321,6 +1454,15 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        {isDownloading && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-paper/80 backdrop-blur-sm">
+            <div className="flex flex-col items-center gap-4">
+              <Loader2 size={32} className="animate-spin text-accent" />
+              <p className="font-mono text-xs uppercase tracking-widest font-bold text-accent">Downloading from Cloud...</p>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -1804,7 +1946,7 @@ export default function App() {
                               if (saved.data) {
                                 loadFromLibrary(saved);
                               } else {
-                                alert("File này chỉ có trên Cloud. Vui lòng tải lên lại để đọc trên thiết bị này.");
+                                downloadFromCloud(saved);
                               }
                             }}
                           >
@@ -1922,17 +2064,39 @@ export default function App() {
                 animate={{ 
                   opacity: 1, 
                   y: 0,
-                  height: 'auto'
+                  height: isAiPanelMinimized ? 'auto' : aiPanelSize.height,
+                  width: isAiPanelMinimized ? undefined : aiPanelSize.width
                 }}
                 exit={{ opacity: 0, y: isAiPanelMinimized ? -50 : 50 }}
+                transition={{ duration: isResizing ? 0 : 0.3 }} // Disable animation during resize
                 className={cn(
-                  "absolute right-4 sm:right-8 bg-panel border border-glass-border rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.5)] overflow-hidden z-50 flex flex-col backdrop-blur-xl transition-all duration-500 ease-in-out",
+                  "absolute right-4 sm:right-8 bg-panel border border-glass-border rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.5)] overflow-hidden z-50 flex flex-col backdrop-blur-xl",
+                  !isResizing && "transition-all duration-500 ease-in-out",
                   isAiPanelMinimized 
                     ? "top-4 w-64 sm:w-72 max-h-16" 
-                    : "bottom-28 w-[calc(100%-2rem)] sm:w-[600px] max-h-[60vh] sm:max-h-[75vh]"
+                    : "bottom-28 max-w-[calc(100vw-2rem)] max-h-[calc(100vh-8rem)]"
                 )}
               >
-                <div className="p-4 sm:p-5 border-b border-glass-border flex items-center justify-between bg-glass shrink-0">
+                {!isAiPanelMinimized && (
+                  <div 
+                    className="absolute top-0 left-0 w-8 h-8 cursor-nwse-resize z-50 flex items-start justify-start p-2 group"
+                    onMouseDown={(e) => { e.preventDefault(); setIsResizing(true); }}
+                    onTouchStart={(e) => { e.preventDefault(); setIsResizing(true); }}
+                  >
+                    <div className="w-3 h-3 border-t-2 border-l-2 border-ink/20 group-hover:border-accent transition-colors rounded-tl-sm" />
+                  </div>
+                )}
+
+                {isResizing && (
+                  <div className="absolute inset-0 pointer-events-none z-0 opacity-10"
+                       style={{
+                         backgroundImage: 'linear-gradient(currentColor 1px, transparent 1px), linear-gradient(90deg, currentColor 1px, transparent 1px)',
+                         backgroundSize: '50px 50px'
+                       }}
+                  />
+                )}
+                
+                <div className="p-4 sm:p-5 border-b border-glass-border flex items-center justify-between bg-glass shrink-0 pl-8 relative z-10">
                   <div className="flex items-center gap-3">
                     <div className="w-1 h-6 bg-accent rounded-full shadow-[0_0_10px_var(--color-accent-glow)]" />
                     <span className="text-xs sm:text-sm uppercase font-display font-bold text-ink tracking-widest">Trợ lý AI</span>
@@ -1952,7 +2116,7 @@ export default function App() {
                 </div>
                 
                 {!isAiPanelMinimized && (
-                  <div className="flex-1 overflow-y-auto p-6 sm:p-8 custom-scrollbar">
+                  <div className="flex-1 overflow-y-auto p-6 sm:p-8 custom-scrollbar relative z-10">
                   {isTranslating || isSummarizing ? (
                     <div className="flex flex-col items-center justify-center py-16 sm:py-20 gap-6 sm:gap-8">
                       <div className="relative">
@@ -2073,7 +2237,7 @@ export default function App() {
                           <div className="space-y-1.5">
                             <label className="text-[9px] uppercase font-bold text-ink/30 tracking-widest">Tốc độ</label>
                             <div className="flex gap-1">
-                              {[1, 1.15, 1.25].map((rate) => (
+                              {[1, 1.1, 1.15, 1.2].map((rate) => (
                                 <button
                                   key={rate}
                                   onClick={() => setPlaybackRate(rate)}
@@ -2284,6 +2448,15 @@ export default function App() {
           </button>
         </div>
       </div>
+
+      {isDownloading && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-paper/80 backdrop-blur-sm">
+          <div className="flex flex-col items-center gap-4">
+            <Loader2 size={32} className="animate-spin text-accent" />
+            <p className="font-mono text-xs uppercase tracking-widest font-bold text-accent">Downloading from Cloud...</p>
+          </div>
+        </div>
+      )}
     </div>
     </ErrorBoundary>
   );
