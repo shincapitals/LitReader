@@ -1,0 +1,96 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=Inter:wght@300;400;600&family=JetBrains+Mono:wght@400;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Space Grotesk", sans-serif;
+  --font-serif: "Space Grotesk", sans-serif; /* Fallback to display for futuristic look */
+  --font-sans: "Inter", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  --color-ink: #ffffff;
+  --color-paper: #0a0a0a;
+  --color-accent: #ccff00;
+  --color-surface: #161616;
+  --color-panel: #0f0f0f;
+  --color-glass: rgba(255, 255, 255, 0.05);
+  --color-glass-border: rgba(255, 255, 255, 0.1);
+  --color-accent-glow: rgba(204, 255, 0, 0.2);
+  --color-accent-glow-hover: rgba(204, 255, 0, 0.4);
+}
+
+.light {
+  --color-ink: #0a0a0a;
+  --color-paper: #f8f8f8;
+  --color-accent: #7c3aed;
+  --color-surface: #ffffff;
+  --color-panel: #f0f0f0;
+  --color-glass: rgba(0, 0, 0, 0.05);
+  --color-glass-border: rgba(0, 0, 0, 0.1);
+  --color-accent-glow: rgba(124, 58, 237, 0.2);
+  --color-accent-glow-hover: rgba(124, 58, 237, 0.4);
+}
+
+@layer base {
+  body {
+    @apply bg-paper text-ink font-sans antialiased;
+  }
+}
+
+.magazine-grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 1.5rem;
+}
+
+.glass-panel {
+  background-color: var(--color-glass);
+  backdrop-filter: blur(24px);
+  border: 1px solid var(--color-glass-border);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.1);
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  @apply bg-accent/50 rounded-full hover:bg-accent;
+}
+
+.italic-quotes blockquote {
+  @apply italic border-l-2 border-accent pl-4 my-4 text-ink/80;
+}
+
+.italic-quotes p {
+  @apply mb-4 last:mb-0;
+}
+
+.custom-outline ul {
+  list-style: none;
+  padding-left: 1rem;
+}
+
+.custom-outline > ul {
+  padding-left: 0;
+}
+
+.custom-outline li {
+  margin-bottom: 0.5rem;
+}
+
+.custom-outline a {
+  color: var(--color-ink);
+  text-decoration: none;
+  font-size: 0.875rem;
+  transition: color 0.2s;
+  opacity: 0.8;
+}
+
+.custom-outline a:hover {
+  color: var(--color-accent);
+  opacity: 1;
+}

@@ -1,0 +1,40 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email"]
+    },
+    "FileMetadata": {
+      "title": "FileMetadata",
+      "description": "Metadata for uploaded PDF files",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "size": { "type": "number" },
+        "timestamp": { "type": "number" },
+        "ownerUid": { "type": "string" }
+      },
+      "required": ["id", "name", "ownerUid"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "User",
+      "description": "User profile document"
+    },
+    "/users/{uid}/files/{fileId}": {
+      "schema": "FileMetadata",
+      "description": "User-specific file metadata"
+    }
+  }
+}
