@@ -80,10 +80,13 @@ const getGenAI = () => {
 const VOICE_OPTIONS = [
   { id: 'zephyr_north', name: 'Zephyr', label: 'Nữ miền Bắc (Thanh thoát)', desc: 'giọng nữ miền Bắc Việt Nam, thanh thoát, rõ ràng' },
   { id: 'zephyr_young_north', name: 'Zephyr', label: 'Nữ miền Bắc (Trẻ trung)', desc: 'giọng nữ miền Bắc Việt Nam, trẻ trung, năng động' },
+  { id: 'zephyr_student', name: 'Zephyr', label: 'Nữ sinh viên (Nhí nhảnh)', desc: 'giọng nữ sinh viên Việt Nam, nhí nhảnh, vui tươi' },
   { id: 'kore_cute_south', name: 'Kore', label: 'Nữ miền Nam (Dễ thương)', desc: 'giọng nữ miền Nam Việt Nam, dễ thương, ngọt ngào' },
   { id: 'kore_south', name: 'Kore', label: 'Nữ miền Nam (Nhẹ nhàng)', desc: 'giọng nữ miền Nam Việt Nam, nhẹ nhàng, truyền cảm' },
+  { id: 'kore_genz', name: 'Kore', label: 'Nữ GenZ (Hiện đại)', desc: 'giọng nữ GenZ Việt Nam, hiện đại, cá tính' },
   { id: 'zephyr_teen', name: 'Zephyr', label: 'Nữ thiếu niên (Trong sáng)', desc: 'giọng nữ thiếu niên, trong sáng, hồn nhiên' },
   { id: 'kore_central', name: 'Kore', label: 'Nữ miền Trung (Ấm áp)', desc: 'giọng nữ miền Trung Việt Nam, ấm áp, chân thành' },
+  { id: 'kore_young_central', name: 'Kore', label: 'Nữ miền Trung (Trẻ trung)', desc: 'giọng nữ miền Trung Việt Nam, trẻ trung, năng động' },
   { id: 'kore_gentle_central', name: 'Kore', label: 'Nữ miền Trung (Dịu dàng)', desc: 'giọng nữ miền Trung Việt Nam, dịu dàng, sâu lắng' },
   { id: 'puck_south', name: 'Puck', label: 'Nam miền Nam (Trẻ trung)', desc: 'giọng nam miền Nam Việt Nam, trẻ trung, năng động' },
   { id: 'charon_north', name: 'Charon', label: 'Nam miền Bắc (Trầm ấm)', desc: 'giọng nam miền Bắc Việt Nam, trầm ấm, chững chạc' },
@@ -186,6 +189,37 @@ export default function App() {
   const [isTtsLoading, setIsTtsLoading] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [aiSuggestion, setAiSuggestion] = useState<string | null>(null);
+
+  // Helper to parse AI errors and provide user-friendly messages
+  const handleAiError = useCallback((error: any, context: 'translation' | 'summary' | 'tts') => {
+    const errorMsg = error?.message || String(error);
+    console.error(`AI Error (${context}):`, error);
+
+    let message = "Đã xảy ra lỗi không xác định.";
+    let suggestion = "Vui lòng thử lại sau.";
+
+    if (errorMsg.includes('429') || errorMsg.includes('RESOURCE_EXHAUSTED')) {
+      message = "Hết hạn mức sử dụng (Quota Exceeded).";
+      suggestion = "Bạn đã đạt giới hạn yêu cầu. Vui lòng đợi một lát rồi thử lại hoặc kiểm tra cài đặt thanh toán của bạn.";
+    } else if (errorMsg.includes('SAFETY') || errorMsg.includes('blocked')) {
+      message = "Nội dung bị chặn bởi bộ lọc an toàn.";
+      suggestion = "Trình AI không thể xử lý nội dung này vì lý do an toàn. Thử chọn trang khác hoặc nội dung khác.";
+    } else if (errorMsg.includes('500') || errorMsg.includes('INTERNAL')) {
+      message = "Lỗi máy chủ AI.";
+      suggestion = "Máy chủ đang gặp sự cố tạm thời. Vui lòng thử lại sau vài giây.";
+    } else if (errorMsg.includes('xhr') || errorMsg.includes('fetch') || errorMsg.includes('network')) {
+      message = "Lỗi kết nối mạng.";
+      suggestion = "Không thể kết nối với máy chủ AI. Vui lòng kiểm tra kết nối internet của bạn.";
+    } else if (errorMsg.includes('API key')) {
+      message = "Lỗi xác thực API.";
+      suggestion = "Khóa API không hợp lệ hoặc đã hết hạn. Vui lòng kiểm tra lại cấu hình.";
+    }
+
+    setAiError(message);
+    setAiSuggestion(suggestion);
+  }, []);
+
   const [targetLang, setTargetLang] = useState('Vietnamese');
   const [voiceId, setVoiceId] = useState<string>('zephyr_north');
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -199,7 +233,7 @@ export default function App() {
   // Customization state
   const [fontFamily, setFontFamily] = useState<'font-sans' | 'font-serif' | 'font-mono'>('font-sans');
   const [translationStyle, setTranslationStyle] = useState<'magazine' | 'normal' | 'casual'>('casual');
-  const [playbackRate, setPlaybackRate] = useState<number>(1.15);
+  const [playbackRate, setPlaybackRate] = useState<number>(1.2);
   const [isPageRendering, setIsPageRendering] = useState(false);
   const [hasOutline, setHasOutline] = useState<boolean | null>(null);
   const [autoRead, setAutoRead] = useState(true);
@@ -346,6 +380,7 @@ export default function App() {
     // Reset AI panel on page change
     setTranslatedText(null);
     setSummaryText(null);
+    setCurrentPageText(null);
     setAiError(null);
     stopTts();
   }, [isSpreadView, numPages, stopTts]);
@@ -355,6 +390,7 @@ export default function App() {
     // Reset AI panel on page change
     setTranslatedText(null);
     setSummaryText(null);
+    setCurrentPageText(null);
     setAiError(null);
     stopTts();
   }, [numPages, stopTts]);
@@ -414,7 +450,12 @@ export default function App() {
     if (!text || !isAudioEnabled) return;
 
     // Clean text for better TTS quality and batching
-    text = text.replace(/\s+/g, ' ').trim();
+    // Merge multiple lines and sentences into a single clean paragraph to minimize API calls and improve flow
+    text = text
+      .replace(/\r?\n|\r/g, ' ') // Replace all newlines with spaces
+      .replace(/\s+/g, ' ')      // Collapse multiple spaces
+      .trim();
+    
     if (text.length === 0) return;
     
     // If already playing or loading and we're toggling (no new text passed), stop it.
@@ -429,6 +470,7 @@ export default function App() {
     stopTts();
     const myPlayId = currentPlayIdRef.current;
     setAiError(null);
+    setAiSuggestion(null);
 
     // Check cache first
     const cacheKey = `${voiceId}_${text.substring(0, 100)}_${text.length}`;
@@ -510,7 +552,7 @@ export default function App() {
         for (let i = 0; i <= retries; i++) {
           try {
             return await ai.models.generateContent({
-              model: "gemini-2.5-flash-preview-tts",
+              model: "gemini-2.5-pro-preview-tts",
               contents: [{ parts: [{ text: `Đọc nội dung sau đây bằng ${voiceDescription}: ${text}` }] }],
               config: {
                 responseModalities: [Modality.AUDIO],
@@ -1002,34 +1044,6 @@ export default function App() {
     );
   }, [searchQuery]);
 
-  const handleAiError = useCallback((error: any, context: 'translation' | 'summary' | 'tts') => {
-    console.error(`${context} error:`, error);
-    
-    let message = "Đã xảy ra lỗi không xác định.";
-    let suggestion = "Vui lòng thử lại sau hoặc làm mới trang.";
-
-    const errorMsg = error?.message || "";
-    
-    if (errorMsg.includes('429') || errorMsg.includes('RESOURCE_EXHAUSTED') || errorMsg.includes('quota')) {
-      message = "Đã hết hạn mức sử dụng AI (Quota exceeded).";
-      suggestion = "Hệ thống đang quá tải hoặc bạn đã dùng hết lượt miễn phí trong lúc này. Vui lòng đợi 1-2 phút rồi thử lại.";
-    } else if (errorMsg.includes('fetch') || errorMsg.includes('network') || errorMsg.includes('NetworkError')) {
-      message = "Lỗi kết nối mạng.";
-      suggestion = "Vui lòng kiểm tra lại đường truyền internet của bạn và thử lại.";
-    } else if (errorMsg.includes('400') || errorMsg.includes('INVALID_ARGUMENT')) {
-      message = "Nội dung không hợp lệ hoặc quá lớn.";
-      suggestion = "Trang này có thể chứa quá nhiều dữ liệu hoặc định dạng không hỗ trợ. Thử chuyển sang trang khác xem sao.";
-    } else if (errorMsg.includes('500') || errorMsg.includes('INTERNAL') || errorMsg.includes('xhr') || errorMsg.includes('Rpc failed')) {
-      message = "Lỗi máy chủ AI hoặc kết nối.";
-      suggestion = "Máy chủ Google Gemini đang gặp sự cố tạm thời hoặc kết nối bị gián đoạn. Vui lòng thử lại sau vài giây.";
-    } else if (errorMsg.includes('SAFETY')) {
-      message = "Nội dung bị chặn do chính sách an toàn.";
-      suggestion = "AI từ chối xử lý nội dung này vì lý do bảo mật hoặc nhạy cảm.";
-    }
-
-    setAiError(`${message}\n\n💡 Gợi ý: ${suggestion}`);
-  }, []);
-
   // Continuous Reading Logic
   useEffect(() => {
     if (isContinuousReading && isDocumentLoaded && currentPageText && !isPlaying && !isTtsLoading && aiMode === 'reading') {
@@ -1069,6 +1083,7 @@ export default function App() {
       setTranslatedText(translationCache.current[cacheKey]);
       setIsAiPanelOpen(true);
       setAiError(null);
+      setAiSuggestion(null);
       if (autoRead && isAudioEnabled) {
         setTimeout(() => playTts(translationCache.current[cacheKey]), 100);
       }
@@ -1083,6 +1098,7 @@ export default function App() {
         setTranslatedText(cached);
         setIsAiPanelOpen(true);
         setAiError(null);
+        setAiSuggestion(null);
         if (autoRead && isAudioEnabled) {
           setTimeout(() => playTts(cached), 100);
         }
@@ -1096,6 +1112,7 @@ export default function App() {
     setIsTranslating(true);
     setTranslatedText(null);
     setAiError(null);
+    setAiSuggestion(null);
     stopTts();
 
     try {
@@ -1177,6 +1194,7 @@ export default function App() {
       setIsAiPanelOpen(true);
       setAiMode('summary');
       setAiError(null);
+      setAiSuggestion(null);
       if (autoRead && isAudioEnabled) {
         setTimeout(() => playTts(summaryCache.current[cacheKey]), 100);
       }
@@ -1192,6 +1210,7 @@ export default function App() {
         setIsAiPanelOpen(true);
         setAiMode('summary');
         setAiError(null);
+        setAiSuggestion(null);
         if (autoRead && isAudioEnabled) {
           setTimeout(() => playTts(cached), 100);
         }
@@ -1206,6 +1225,7 @@ export default function App() {
     setIsSummarizing(true);
     setSummaryText(null);
     setAiError(null);
+    setAiSuggestion(null);
     stopTts();
 
     try {
@@ -1556,6 +1576,8 @@ export default function App() {
             onClick={() => {
               setAiMode('reading');
               setIsAiPanelOpen(true);
+              setAiError(null);
+              setAiSuggestion(null);
               playTts();
             }}
             className={cn(
@@ -1571,7 +1593,11 @@ export default function App() {
           </button>
 
           <button 
-            onClick={translatePage}
+            onClick={() => {
+              setAiError(null);
+              setAiSuggestion(null);
+              translatePage();
+            }}
             className={cn(
               "p-2 rounded-full transition-all flex items-center gap-2 px-3 sm:px-4 border shadow-md group relative overflow-hidden",
               isAiPanelOpen && aiMode === 'translation' 
@@ -1598,7 +1624,11 @@ export default function App() {
           </button>
 
           <button 
-            onClick={summarizePage}
+            onClick={() => {
+              setAiError(null);
+              setAiSuggestion(null);
+              summarizePage();
+            }}
             className={cn(
               "p-2 rounded-full transition-all flex items-center gap-2 px-3 border shadow-sm",
               isAiPanelOpen && aiMode === 'summary' 
@@ -1608,7 +1638,7 @@ export default function App() {
             title="Summarize current page"
           >
             <LayoutGrid size={18} />
-            <span className="text-[10px] uppercase font-bold tracking-widest hidden sm:inline">Tóm</span>
+            <span className="text-[10px] uppercase font-bold tracking-widest hidden sm:inline">TÓM TẮT</span>
           </button>
 
           <button 
@@ -2131,7 +2161,11 @@ export default function App() {
                     <div className="space-y-6 sm:space-y-8">
                       <div className="flex p-1 bg-glass rounded-xl border border-glass-border">
                         <button 
-                          onClick={() => setAiMode('translation')}
+                          onClick={() => {
+                            setAiMode('translation');
+                            setAiError(null);
+                            setAiSuggestion(null);
+                          }}
                           className={cn(
                             "flex-1 py-2 text-[9px] uppercase font-bold tracking-widest rounded-lg transition-all duration-300",
                             aiMode === 'translation' ? "bg-accent text-paper shadow-md" : "text-ink/40 hover:text-ink/70"
@@ -2140,7 +2174,11 @@ export default function App() {
                           Dịch
                         </button>
                         <button 
-                          onClick={() => setAiMode('summary')}
+                          onClick={() => {
+                            setAiMode('summary');
+                            setAiError(null);
+                            setAiSuggestion(null);
+                          }}
                           className={cn(
                             "flex-1 py-2 text-[9px] uppercase font-bold tracking-widest rounded-lg transition-all duration-300",
                             aiMode === 'summary' ? "bg-accent text-paper shadow-md" : "text-ink/40 hover:text-ink/70"
@@ -2184,7 +2222,11 @@ export default function App() {
                                 Trang {pageNumber} / {numPages}
                               </div>
                               <button 
-                                onClick={() => changePage(1)}
+                                onClick={() => {
+                        setAiError(null);
+                        setAiSuggestion(null);
+                        changePage(1);
+                      }}
                                 disabled={pageNumber >= numPages}
                                 className="p-2 bg-ink/5 rounded-lg hover:bg-ink/10 disabled:opacity-30 transition-all"
                               >
@@ -2237,7 +2279,7 @@ export default function App() {
                           <div className="space-y-1.5">
                             <label className="text-[9px] uppercase font-bold text-ink/30 tracking-widest">Tốc độ</label>
                             <div className="flex gap-1">
-                              {[1, 1.1, 1.15, 1.2].map((rate) => (
+                              {[1, 1.1, 1.2, 1.5].map((rate) => (
                                 <button
                                   key={rate}
                                   onClick={() => setPlaybackRate(rate)}
@@ -2298,7 +2340,11 @@ export default function App() {
                             </button>
                             
                             <button 
-                              onClick={() => playTts()}
+                              onClick={() => {
+                        setAiError(null);
+                        setAiSuggestion(null);
+                        playTts();
+                      }}
                               disabled={(!isTtsLoading && (aiMode === 'translation' ? !translatedText : aiMode === 'summary' ? !summaryText : !currentPageText))}
                               className={cn(
                                 "w-10 h-10 rounded-full flex items-center justify-center transition-all active:scale-90",
@@ -2335,24 +2381,42 @@ export default function App() {
                               <div className="p-1.5 bg-red-500/10 rounded-lg shrink-0">
                                 <AlertCircle size={14} className="text-red-500" />
                               </div>
-                              <div className="space-y-1.5">
+                              <div className="space-y-2">
                                 <p className="font-bold uppercase tracking-wider text-[10px] text-red-500/70">Thông báo lỗi</p>
-                                <div className="whitespace-pre-wrap leading-relaxed opacity-90">
+                                <div className="whitespace-pre-wrap leading-relaxed font-bold text-sm">
                                   {aiError}
                                 </div>
+                                {aiSuggestion && (
+                                  <div className="text-ink/60 dark:text-ink/40 font-normal leading-relaxed border-l-2 border-red-500/20 pl-3 py-1">
+                                    <span className="font-bold text-[10px] uppercase tracking-tight block mb-1 opacity-50">Gợi ý khắc phục:</span>
+                                    {aiSuggestion}
+                                  </div>
+                                )}
                               </div>
                             </div>
-                            <button 
-                              onClick={() => {
-                                setAiError(null);
-                                if (aiMode === 'translation') translatePage();
-                                else if (aiMode === 'summary') summarizePage();
-                                else playTts();
-                              }}
-                              className="bg-red-500 text-white hover:bg-red-600 px-6 py-2.5 rounded-xl self-start transition-all duration-300 font-bold shadow-lg shadow-red-500/20 active:scale-95"
-                            >
-                              Thử lại ngay
-                            </button>
+                            <div className="flex gap-2">
+                              <button 
+                                onClick={() => {
+                                  setAiError(null);
+                                  setAiSuggestion(null);
+                                  if (aiMode === 'translation') translatePage();
+                                  else if (aiMode === 'summary') summarizePage();
+                                  else playTts();
+                                }}
+                                className="bg-red-500 text-white hover:bg-red-600 px-6 py-2.5 rounded-xl transition-all duration-300 font-bold shadow-lg shadow-red-500/20 active:scale-95 flex-1 sm:flex-none"
+                              >
+                                Thử lại ngay
+                              </button>
+                              <button 
+                                onClick={() => {
+                                  setAiError(null);
+                                  setAiSuggestion(null);
+                                }}
+                                className="bg-ink/5 hover:bg-ink/10 text-ink/60 px-6 py-2.5 rounded-xl transition-all duration-300 font-bold flex-1 sm:flex-none"
+                              >
+                                Bỏ qua
+                              </button>
+                            </div>
                           </div>
                         )}
 
