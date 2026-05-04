@@ -2,9 +2,11 @@
 export interface SavedFile {
   id: string;
   name: string;
-  data: Blob;
+  data?: Blob;
   timestamp: number;
   size: number;
+  url?: string;
+  ownerUid?: string;
 }
 
 const DB_NAME = 'vogue_reader_db';

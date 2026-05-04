@@ -36,8 +36,10 @@ service cloud.firestore {
 
     function isAdmin() {
       return isAuthenticated() &&
-        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
-          (request.auth.token.email == "shincapitals@gmail.com" && request.auth.token.email_verified == true));
+        ( (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+           get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'user') == 'admin') ||
+          (request.auth.token.email == "shincapitals@gmail.com" && request.auth.token.email_verified == true)
+        );
     }
 
     function isValidEmail(email) {
@@ -63,14 +65,35 @@ service cloud.firestore {
 
     match /users/{uid} {
       allow read: if isOwner(uid) || isAdmin();
-      allow create: if isOwner(uid) && isValidUser(request.resource.data) && (!('role' in request.resource.data) || isAdmin());
-      allow update: if isOwner(uid) && isValidUser(request.resource.data) && (request.resource.data.role == resource.data.role || isAdmin());
+      allow create: if isOwner(uid) && isValidUser(request.resource.data);
+      allow update: if isOwner(uid) && isValidUser(request.resource.data);
 
       match /files/{fileId} {
         allow read: if isOwner(uid) || isAdmin();
         allow create: if isOwner(uid) && isValidFile(request.resource.data);
         allow update: if isOwner(uid) && isValidFile(request.resource.data);
         allow delete: if isOwner(uid) || isAdmin();
+      }
+
+      match /translations/{translationId} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow write: if isOwner(uid) || isAdmin();
+      }
+
+      match /audio/{audioId} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow write: if isOwner(uid) || isAdmin();
+      }
+
+      match /library/{bookId} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow write: if isOwner(uid) || isAdmin();
+        allow delete: if isOwner(uid) || isAdmin();
+      }
+
+      match /progress/{progressId} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow write: if isOwner(uid) || isAdmin();
       }
     }
   }

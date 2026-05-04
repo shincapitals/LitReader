@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useEffect, useMemo, useRef, Component, ReactNode } from 'react';
+import Markdown from 'react-markdown';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Upload, 
@@ -23,6 +24,7 @@ import {
   VolumeX,
   Languages,
   Play,
+  PlaySquare,
   Pause,
   PlayCircle,
   Loader2,
@@ -36,9 +38,16 @@ import {
   ZoomOut,
   RotateCcw,
   RotateCw,
-  RefreshCw
+  RefreshCw,
+  LogIn,
+  Gauge,
+  Repeat,
+  FileText,
+  UploadCloud,
+  Download
 } from 'lucide-react';
 import { Document, Page, Outline, pdfjs } from 'react-pdf';
+import JSZip from 'jszip';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import { GoogleGenAI, Modality } from "@google/genai";
@@ -62,9 +71,10 @@ import {
   doc, 
   setDoc, 
   deleteDoc,
-  getDocs
+  getDocs,
+  getDoc
 } from 'firebase/firestore';
-import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
+import { ref, uploadBytes, getDownloadURL, deleteObject, uploadString } from 'firebase/storage';
 
 import { cn } from './lib/utils';
 import { HistoryItem } from './types';
@@ -164,6 +174,8 @@ export default function App() {
 
   // Bookmarks and History state
   const [bookmarks, setBookmarks] = useState<number[]>([]);
+  const [bookmarkTranslations, setBookmarkTranslations] = useState<Record<number, string>>({});
+  const [isTranslatingBookmarks, setIsTranslatingBookmarks] = useState<Record<number, boolean>>({});
   const [readingHistory, setReadingHistory] = useState<HistoryItem[]>([]);
   const [savedLibrary, setSavedLibrary] = useState<SavedFile[]>([]);
   const [isSaving, setIsSaving] = useState(false);
@@ -171,10 +183,8 @@ export default function App() {
 
   // AI Features state
   const [translatedText, setTranslatedText] = useState<string | null>(null);
-  const [summaryText, setSummaryText] = useState<string | null>(null);
   const [isTranslating, setIsTranslating] = useState(false);
-  const [isSummarizing, setIsSummarizing] = useState(false);
-  const [aiMode, setAiMode] = useState<'translation' | 'summary' | 'reading'>('translation');
+  const [aiMode, setAiMode] = useState<'translation' | 'advanced' | 'reading'>('translation');
   const [isAiPanelOpen, setIsAiPanelOpen] = useState(false);
   const [aiPanelSize, setAiPanelSize] = useState({ width: 600, height: 500 });
   const [isResizing, setIsResizing] = useState(false);
@@ -182,6 +192,7 @@ export default function App() {
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [isAiPanelMinimized, setIsAiPanelMinimized] = useState(false);
   const [isDocumentLoaded, setIsDocumentLoaded] = useState(false);
+  const [isUploadingPdf, setIsUploadingPdf] = useState(false);
   const [isDarkMode, setIsDarkMode] = useState(() => {
     const saved = localStorage.getItem('litreader_dark_mode');
     return saved !== null ? JSON.parse(saved) : true;
@@ -190,6 +201,491 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiSuggestion, setAiSuggestion] = useState<string | null>(null);
+  const [isServedFromCache, setIsServedFromCache] = useState(false);
+  const [aiFontSize, setAiFontSize] = useState<number>(() => parseInt(localStorage.getItem('litreader_ai_font_size') || '14'));
+  const [isAudioDownloading, setIsAudioDownloading] = useState(false);
+  const [currentTtsCacheKey, setCurrentTtsCacheKey] = useState<string | null>(null);
+
+  // Partial translation & selection state
+  const [selectedText, setSelectedText] = useState<string | null>(null);
+  const [selectionPosition, setSelectionPosition] = useState<{ x: number, y: number } | null>(null);
+  const selectionTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Batch Translation state
+  const [isBatchTranslating, setIsBatchTranslating] = useState(false);
+  const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 });
+  const [batchRange, setBatchRange] = useState({ start: 1, end: 1 });
+  const batchAbortRef = useRef<AbortController | null>(null);
+  const [isBatchTtsing, setIsBatchTtsing] = useState(false);
+  const [batchTtsProgress, setBatchTtsProgress] = useState({ current: 0, total: 0 });
+  const [pdfOutline, setPdfOutline] = useState<any[] | null>(null);
+  const [renderQuality, setRenderQuality] = useState<'fast' | 'high'>(() => {
+    const saved = localStorage.getItem('litreader_render_quality');
+    return (saved as 'fast' | 'high') || 'high';
+  });
+
+  // Handle Text Selection
+  const handleSelection = useCallback((e: MouseEvent | TouchEvent) => {
+    if (selectionTimerRef.current) clearTimeout(selectionTimerRef.current);
+    
+    selectionTimerRef.current = setTimeout(() => {
+      const selection = window.getSelection();
+      const text = selection?.toString().trim();
+      
+      if (text && text.length > 5 && text.length < 5000) {
+        const range = selection?.getRangeAt(0);
+        const rect = range?.getBoundingClientRect();
+        
+        if (rect) {
+          setSelectedText(text);
+          setSelectionPosition({
+            x: rect.left + rect.width / 2,
+            y: rect.top - 10
+          });
+        }
+      } else {
+        setSelectedText(null);
+        setSelectionPosition(null);
+      }
+    }, 200);
+  }, []);
+
+  useEffect(() => {
+    document.addEventListener('mouseup', handleSelection);
+    return () => document.removeEventListener('mouseup', handleSelection);
+  }, [handleSelection]);
+
+  const translatePartial = async (text: string) => {
+    if (!text || isTranslating) return;
+    
+    setIsAiPanelOpen(true);
+    setAiMode('translation');
+    setIsTranslating(true);
+    setTranslatedText(null);
+    setAiError(null);
+    setSelectedText(null);
+    setSelectionPosition(null);
+    
+    try {
+      const ai = getGenAI();
+      const systemInstruction = `Bạn là một biên tập viên dịch thuật. Dịch đoạn văn bản sau đây sang ${targetLang}. CHỈ trả về bản dịch.`;
+      
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [{ parts: [{ text: `Dịch đoạn này sang ${targetLang}: ${text}` }] }],
+        config: { systemInstruction }
+      });
+      
+      const translated = response.candidates?.[0]?.content?.parts?.[0]?.text || "Không thể dịch.";
+      setTranslatedText(translated);
+    } catch (error: any) {
+      handleAiError(error, 'translation');
+    } finally {
+      setIsTranslating(false);
+    }
+  };
+
+  const translateBookmarkPage = async (p: number) => {
+    if (!file || isTranslatingBookmarks[p]) return;
+    
+    setIsTranslatingBookmarks(prev => ({ ...prev, [p]: true }));
+    
+    try {
+      // Extract text for this page
+      let pdf = pdfDocRef.current;
+      if (!pdf) {
+        const data = await file.arrayBuffer();
+        pdf = await pdfjs.getDocument({ data }).promise;
+        pdfDocRef.current = pdf;
+      }
+      
+      const page = await pdf.getPage(p);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items.map((item: any) => item.str).join(' ');
+      
+      if (!pageText.trim()) throw new Error("No text on page");
+
+      const ai = getGenAI();
+      const systemInstruction = `Bạn là một biên tập viên dịch thuật. Dịch đoạn văn bản sau đây sang ${targetLang}. CHỈ trả về bản dịch.`;
+      
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [{ parts: [{ text: `Dịch nội dung trang sách này sang ${targetLang}: ${pageText.substring(0, 5000)}` }] }],
+        config: { systemInstruction }
+      });
+      
+      const translated = response.candidates?.[0]?.content?.parts?.[0]?.text || "Không thể dịch.";
+      
+      const newTranslations = { ...bookmarkTranslations, [p]: translated };
+      setBookmarkTranslations(newTranslations);
+      
+      if (user) {
+        const docRef = doc(db, 'users', user.uid, 'translations', `bookmarks_${persistenceKey}`);
+        await setDoc(docRef, newTranslations, { merge: true });
+      }
+    } catch (error) {
+      console.error("Bookmark translation error:", error);
+      alert("Lỗi khi dịch dấu trang.");
+    } finally {
+      setIsTranslatingBookmarks(prev => ({ ...prev, [p]: false }));
+    }
+  };
+
+  const translateAllBookmarks = async () => {
+    if (bookmarks.length === 0) return;
+    for (const p of bookmarks) {
+      if (!bookmarkTranslations[p]) {
+        await translateBookmarkPage(p);
+        // Small delay
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+  };
+
+  const startBatchTranslation = async () => {
+    if (!file || isBatchTranslating) return;
+    
+    const { start, end } = batchRange;
+    const total = end - start + 1;
+    if (total <= 0) return;
+    
+    setIsBatchTranslating(true);
+    setBatchProgress({ current: 0, total });
+    batchAbortRef.current = new AbortController();
+    
+    try {
+      for (let p = start; p <= end; p++) {
+        if (batchAbortRef.current?.signal.aborted) break;
+        
+        setBatchProgress(prev => ({ ...prev, current: p - start + 1 }));
+        
+        // Check cache first to avoid redundant API calls
+        const cacheKey = `trans_${user ? user.uid : 'guest'}_${persistenceKey}_${p}_${targetLang}_${translationStyle}`;
+        const cached = await getCache(cacheKey);
+        
+        if (!cached) {
+          // Extract text for this page
+          let pdf = pdfDocRef.current;
+          if (!pdf) {
+            const data = await file.arrayBuffer();
+            pdf = await pdfjs.getDocument({ data }).promise;
+            pdfDocRef.current = pdf;
+          }
+          
+          const page = await pdf.getPage(p);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items.map((item: any) => item.str).join(' ');
+          
+          if (pageText.trim()) {
+            const ai = getGenAI();
+            const systemInstruction = `Bạn là một biên tập viên dịch thuật chuyên nghiệp cho các tạp chí cao cấp. Dịch sang ${targetLang}. CHỈ trả về bản dịch.`;
+            
+            const response = await ai.models.generateContent({
+              model: "gemini-3-flash-preview",
+              contents: [{ parts: [{ text: pageText }] }],
+              config: { systemInstruction }
+            });
+            
+            const translated = response.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (translated) {
+              await saveCache(cacheKey, translated);
+              if (user) {
+                setDoc(doc(db, 'users', user.uid, 'translations', cacheKey), {
+                  text: translated,
+                  timestamp: Date.now()
+                }).catch(e => console.error("Cloud cache error", e));
+              }
+            }
+          }
+        }
+        
+        // Small delay to prevent rate issues
+        await new Promise(r => setTimeout(r, 500));
+      }
+    } catch (error) {
+      console.error("Batch translation error:", error);
+    } finally {
+      setIsBatchTranslating(false);
+      // If we are on one of the translated pages, refresh UI
+      if (pageNumber >= start && pageNumber <= end) {
+        const cacheKey = `trans_${user ? user.uid : 'guest'}_${persistenceKey}_${pageNumber}_${targetLang}_${translationStyle}`;
+        const cached = await getCache(cacheKey);
+        if (cached) setTranslatedText(cached);
+      }
+    }
+  };
+
+  const startBatchTts = async () => {
+    if (!file || isBatchTtsing) return;
+    
+    const { start, end } = batchRange;
+    const total = end - start + 1;
+    if (total <= 0) return;
+    
+    setIsBatchTtsing(true);
+    setBatchTtsProgress({ current: 0, total });
+    batchAbortRef.current = new AbortController();
+    
+    try {
+      const audioChunks: AudioBuffer[] = [];
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      
+      for (let p = start; p <= end; p++) {
+        if (batchAbortRef.current?.signal.aborted) break;
+        setBatchTtsProgress(prev => ({ ...prev, current: p - start + 1 }));
+        
+        // 1. Get Text (Prefer translated, then original)
+        const transKey = `trans_${user ? user.uid : 'guest'}_${persistenceKey}_${p}_${targetLang}_${translationStyle}`;
+        let text = await getCache(transKey);
+        
+        if (!text) {
+          let pdf = pdfDocRef.current;
+          if (!pdf) {
+            const data = await file.arrayBuffer();
+            pdf = await pdfjs.getDocument({ data }).promise;
+            pdfDocRef.current = pdf;
+          }
+          const page = await pdf.getPage(p);
+          const textContent = await page.getTextContent();
+          text = textContent.items.map((item: any) => item.str).join(' ');
+        }
+
+        if (text?.trim()) {
+          const ttsKey = `tts_${user ? user.uid : 'guest'}_${persistenceKey}_${p}_${voiceId}_${playbackRate}_${targetLang}`;
+          let base64Audio = await getCache(ttsKey);
+          
+          if (!base64Audio) {
+            // Generate TTS if not cached
+            const ai = getGenAI();
+            const response = await ai.models.generateContent({
+              model: "gemini-3-flash-preview",
+              contents: [{ parts: [{ text }] }],
+              config: {
+                responseModalities: [Modality.AUDIO],
+                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceId } } }
+              }
+            });
+            
+            base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+            if (base64Audio) {
+              await saveCache(ttsKey, base64Audio);
+            }
+          }
+
+          if (base64Audio) {
+            const binary = atob(base64Audio);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            let buffer = await ctx.decodeAudioData(bytes.buffer);
+            
+            // Resample if speed is not 1.0 (Nearest Neighbor for simplicity)
+            if (playbackRate !== 1.0) {
+              const newLength = Math.floor(buffer.length / playbackRate);
+              const resampledBuffer = ctx.createBuffer(buffer.numberOfChannels, newLength, buffer.sampleRate);
+              for (let c = 0; c < buffer.numberOfChannels; c++) {
+                const oldData = buffer.getChannelData(c);
+                const newData = resampledBuffer.getChannelData(c);
+                for (let j = 0; j < newLength; j++) {
+                  newData[j] = oldData[Math.floor(j * playbackRate)] || 0;
+                }
+              }
+              buffer = resampledBuffer;
+            }
+            
+            audioChunks.push(buffer);
+          }
+        }
+        
+        await new Promise(r => setTimeout(r, 800)); // Rate limit buffer
+      }
+
+      if (audioChunks.length > 0) {
+        // Concatenate buffers with small gaps
+        const gapSeconds = 0.5;
+        const gapFrames = Math.floor(gapSeconds * audioChunks[0].sampleRate);
+        const totalLength = audioChunks.reduce((acc, buf) => acc + buf.length + gapFrames, 0);
+        
+        const finalBuffer = ctx.createBuffer(
+          audioChunks[0].numberOfChannels,
+          totalLength,
+          audioChunks[0].sampleRate
+        );
+
+        let offset = 0;
+        for (const buf of audioChunks) {
+          for (let channel = 0; channel < buf.numberOfChannels; channel++) {
+            finalBuffer.getChannelData(channel).set(buf.getChannelData(channel), offset);
+          }
+          offset += buf.length + gapFrames;
+        }
+
+        // Convert AudioBuffer to WAV
+        const wavBlob = audioBufferToWav(finalBuffer);
+        const url = URL.createObjectURL(wavBlob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `Audiobook_${file.name.replace(/\.[^/.]+$/, "")}_Pages_${start}-${end}.wav`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      }
+    } catch (error) {
+      console.error("Batch TTS error:", error);
+      alert("Lỗi khi tạo Audio hàng loạt. Vui lòng thử lại.");
+    } finally {
+      setIsBatchTtsing(false);
+    }
+  };
+
+  const downloadBatchAudioZip = async () => {
+    if (!file || isBatchTtsing) return;
+    
+    const { start, end } = batchRange;
+    const total = end - start + 1;
+    if (total <= 0) return;
+    
+    setIsBatchTtsing(true);
+    setBatchTtsProgress({ current: 0, total });
+    batchAbortRef.current = new AbortController();
+    
+    const zip = new JSZip();
+    const folder = zip.folder(`Audio_Pages_${start}_${end}`);
+    
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      
+      for (let p = start; p <= end; p++) {
+        if (batchAbortRef.current?.signal.aborted) break;
+        setBatchTtsProgress(prev => ({ ...prev, current: p - start + 1 }));
+        
+        // 1. Get Text (Prefer translated, then original)
+        const transKey = `trans_${user ? user.uid : 'guest'}_${persistenceKey}_${p}_${targetLang}_${translationStyle}`;
+        let text = await getCache(transKey);
+        
+        if (!text) {
+          let pdf = pdfDocRef.current;
+          if (!pdf) {
+            const data = await file.arrayBuffer();
+            pdf = await pdfjs.getDocument({ data }).promise;
+            pdfDocRef.current = pdf;
+          }
+          const page = await pdf.getPage(p);
+          const textContent = await page.getTextContent();
+          text = textContent.items.map((item: any) => item.str).join(' ');
+        }
+
+        if (text?.trim()) {
+          const ttsKey = `tts_${user ? user.uid : 'guest'}_${persistenceKey}_${p}_${voiceId}_${playbackRate}_${targetLang}`;
+          let base64Audio = await getCache(ttsKey);
+          
+          if (!base64Audio) {
+            const ai = getGenAI();
+            const response = await ai.models.generateContent({
+              model: "gemini-3-flash-preview",
+              contents: [{ parts: [{ text }] }],
+              config: {
+                responseModalities: [Modality.AUDIO],
+                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceId } } }
+              }
+            });
+            
+            base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+            if (base64Audio) {
+              await saveCache(ttsKey, base64Audio);
+            }
+          }
+
+          if (base64Audio) {
+            const binary = atob(base64Audio);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            
+            // If speed is 1.0, we can just save the bytes as MP3 directly (assuming the source is MP3)
+            // But we already have logic to resample for speed, so let's stick to WAV for consistency in batch if speed is changed
+            // Or just save as MP3 if speed is 1.0 to save space.
+            // Actually, the API returns MP3 bytes. If we don't change speed, let's keep MP3.
+            
+            if (playbackRate === 1.0) {
+               folder?.file(`Page_${p}.mp3`, bytes);
+            } else {
+              let buffer = await ctx.decodeAudioData(bytes.buffer);
+              const newLength = Math.floor(buffer.length / playbackRate);
+              const resampledBuffer = ctx.createBuffer(buffer.numberOfChannels, newLength, buffer.sampleRate);
+              for (let c = 0; c < buffer.numberOfChannels; c++) {
+                const oldData = buffer.getChannelData(c);
+                const newData = resampledBuffer.getChannelData(c);
+                for (let j = 0; j < newLength; j++) {
+                  newData[j] = oldData[Math.floor(j * playbackRate)] || 0;
+                }
+              }
+              const wavBlob = audioBufferToWav(resampledBuffer);
+              folder?.file(`Page_${p}.wav`, wavBlob);
+            }
+          }
+        }
+        
+        await new Promise(r => setTimeout(r, 800));
+      }
+
+      const content = await zip.generateAsync({ type: "blob" });
+      const url = URL.createObjectURL(content);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `Batch_Audio_${file.name.replace(/\.[^/.]+$/, "")}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      
+    } catch (error) {
+      console.error("Batch ZIP error:", error);
+      alert("Lỗi khi tạo ZIP audio. Vui lòng thử lại.");
+    } finally {
+      setIsBatchTtsing(false);
+    }
+  };
+
+  // Helper to convert AudioBuffer to WAV
+  const audioBufferToWav = (buffer: AudioBuffer) => {
+    const numOfChan = buffer.numberOfChannels,
+          length = buffer.length * numOfChan * 2 + 44,
+          bufferArr = new ArrayBuffer(length),
+          view = new DataView(bufferArr),
+          channels = [],
+          sampleRate = buffer.sampleRate;
+    let offset = 0, pos = 0;
+
+    const setUint16 = (data: number) => { view.setUint16(pos, data, true); pos += 2; };
+    const setUint32 = (data: number) => { view.setUint32(pos, data, true); pos += 4; };
+
+    setUint32(0x46464952); // "RIFF"
+    setUint32(length - 8); 
+    setUint32(0x45564157); // "WAVE"
+    setUint32(0x20746d66); // "fmt "
+    setUint32(16);
+    setUint16(1);
+    setUint16(numOfChan);
+    setUint32(sampleRate);
+    setUint32(sampleRate * 2 * numOfChan);
+    setUint16(numOfChan * 2);
+    setUint16(16);
+    setUint32(0x61746164); // "data"
+    setUint32(length - pos - 4);
+
+    for (let i = 0; i < numOfChan; i++) channels.push(buffer.getChannelData(i));
+
+    while (pos < length) {
+      for (let i = 0; i < numOfChan; i++) {
+        let sample = Math.max(-1, Math.min(1, channels[i][offset]));
+        sample = (sample < 0 ? sample * 0x8000 : sample * 0x7FFF);
+        view.setInt16(pos, sample, true);
+        pos += 2;
+      }
+      offset++;
+    }
+    return new Blob([bufferArr], { type: 'audio/wav' });
+  };
 
   // Helper to parse AI errors and provide user-friendly messages
   const handleAiError = useCallback((error: any, context: 'translation' | 'summary' | 'tts') => {
@@ -220,8 +716,8 @@ export default function App() {
     setAiSuggestion(suggestion);
   }, []);
 
-  const [targetLang, setTargetLang] = useState('Vietnamese');
-  const [voiceId, setVoiceId] = useState<string>('zephyr_north');
+  const [targetLang, setTargetLang] = useState(() => localStorage.getItem('litreader_target_lang') || 'Vietnamese');
+  const [voiceId, setVoiceId] = useState<string>(() => localStorage.getItem('litreader_voice_id') || 'zephyr_north');
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -232,13 +728,15 @@ export default function App() {
 
   // Customization state
   const [fontFamily, setFontFamily] = useState<'font-sans' | 'font-serif' | 'font-mono'>('font-sans');
-  const [translationStyle, setTranslationStyle] = useState<'magazine' | 'normal' | 'casual'>('casual');
-  const [playbackRate, setPlaybackRate] = useState<number>(1.2);
+  const [translationStyle, setTranslationStyle] = useState<'magazine' | 'normal' | 'casual'>(() => (localStorage.getItem('litreader_trans_style') as any) || 'casual');
+  const [playbackRate, setPlaybackRate] = useState<number>(() => parseFloat(localStorage.getItem('litreader_playback_rate') || '1.2'));
   const [isPageRendering, setIsPageRendering] = useState(false);
   const [hasOutline, setHasOutline] = useState<boolean | null>(null);
-  const [autoRead, setAutoRead] = useState(true);
+  const [autoRead, setAutoRead] = useState(false);
   const [isAudioEnabled, setIsAudioEnabled] = useState(true);
   const [isContinuousReading, setIsContinuousReading] = useState(false);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
   
   // Pre-extracted text for the current page to speed up AI
   const [currentPageText, setCurrentPageText] = useState<string | null>(null);
@@ -248,7 +746,6 @@ export default function App() {
   
   // Cache for AI results to save quota
   const translationCache = useRef<Record<string, string>>({});
-  const summaryCache = useRef<Record<string, string>>({});
   const ttsCache = useRef<Record<string, string>>({});
   
   const isContinuousReadingRef = useRef(isContinuousReading);
@@ -261,7 +758,6 @@ export default function App() {
     numPagesRef.current = numPages;
   }, [isContinuousReading, pageNumber, numPages]);
 
-  const [pageTimes, setPageTimes] = useState<Record<number, number>>({});
   const [isAppActive, setIsAppActive] = useState(true);
 
   // Timer state
@@ -286,13 +782,16 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
 
-    const q = query(collection(db, 'users', user.uid, 'files'));
+    const q = query(collection(db, 'users', user.uid, 'library'));
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const cloudFiles = snapshot.docs.map(doc => doc.data() as SavedFile);
       
-      // Merge with local library (prefer local if exists, but add missing from cloud)
       setSavedLibrary(prev => {
-        const merged = [...prev];
+        // Keep only local files (those with data property)
+        const localFiles = prev.filter(f => f.data);
+        
+        // Combine with cloud files, avoiding duplicates (local takes precedence)
+        const merged = [...localFiles];
         cloudFiles.forEach(cloudFile => {
           if (!merged.some(f => f.id === cloudFile.id)) {
             merged.push(cloudFile);
@@ -301,11 +800,88 @@ export default function App() {
         return merged;
       });
     }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, `users/${user.uid}/files`);
+      handleFirestoreError(error, OperationType.LIST, `users/${user.uid}/library`);
     });
 
     return () => unsubscribe();
   }, [user]);
+
+  // Sync bookmark translations from Firestore
+  useEffect(() => {
+    if (!user || !persistenceKey) return;
+
+    const docRef = doc(db, 'users', user.uid, 'translations', `bookmarks_${persistenceKey}`);
+    const unsubscribe = onSnapshot(docRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setBookmarkTranslations(snapshot.data() as Record<number, string>);
+      }
+    }, (error) => {
+      console.error("Bookmark translations sync error", error);
+    });
+
+    return () => unsubscribe();
+  }, [user, persistenceKey]);
+  useEffect(() => {
+    if (!user) return;
+
+    const q = query(collection(db, 'users', user.uid, 'progress'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      // Ignore local writes to prevent echo
+      if (snapshot.metadata.hasPendingWrites) return;
+
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === 'added' || change.type === 'modified') {
+          const data = change.doc.data();
+          const { id, lastPage, savedBookmarks, timestamp, name, fileSize, totalPages, totalReadingTime } = data;
+          if (!id) return;
+
+          // Merge to readingHistory
+          setReadingHistory(prev => {
+            const index = prev.findIndex(item => item.id === id);
+            
+            // Only update history if cloud timestamp is strictly greater, or it is a new item
+            const localTimestamp = index !== -1 ? prev[index].timestamp : 0;
+            if (timestamp > localTimestamp) {
+               const newItem: HistoryItem = {
+                 id,
+                 name: name || (index !== -1 ? prev[index].name : 'Unknown'),
+                 lastReadPage: lastPage,
+                 totalPages: totalPages || (index !== -1 ? prev[index].totalPages : 0),
+                 timestamp,
+                 fileSize: fileSize || (index !== -1 ? prev[index].fileSize : 0),
+                 totalReadingTime: totalReadingTime || (index !== -1 ? prev[index].totalReadingTime : 0)
+               };
+               
+               const filtered = prev.filter(item => item.id !== id);
+               const updated = [newItem, ...filtered].sort((a,b) => b.timestamp - a.timestamp).slice(0, 10);
+               localStorage.setItem('vogue_reader_history', JSON.stringify(updated));
+               
+               // Update individual local storage cache
+               localStorage.setItem(id, JSON.stringify({
+                 lastPage,
+                 savedBookmarks,
+                 timestamp
+               }));
+
+               // If it's the current file, update state so it updates live
+               if (id === persistenceKey) {
+                 // only update if the page/bookmark is really different
+                 setPageNumber(prev => prev !== lastPage ? lastPage : prev);
+                 setBookmarks(prev => JSON.stringify(prev) !== JSON.stringify(savedBookmarks || []) ? (savedBookmarks || []) : prev);
+               }
+
+               return updated;
+            }
+            return prev;
+          });
+        }
+      });
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, `users/${user.uid}/progress`);
+    });
+
+    return () => unsubscribe();
+  }, [user, persistenceKey]);
 
   // Load global history and library
   useEffect(() => {
@@ -324,6 +900,9 @@ export default function App() {
         if (settings.translationStyle) setTranslationStyle(settings.translationStyle);
         if (settings.playbackRate) setPlaybackRate(settings.playbackRate);
         if (settings.isContinuousReading !== undefined) setIsContinuousReading(settings.isContinuousReading);
+        if (settings.autoRead !== undefined) setAutoRead(settings.autoRead);
+        if (settings.isAudioEnabled !== undefined) setIsAudioEnabled(settings.isAudioEnabled);
+        if (settings.aiFontSize !== undefined) setAiFontSize(settings.aiFontSize);
       } catch (e) {
         console.error("Failed to parse AI settings", e);
       }
@@ -334,8 +913,24 @@ export default function App() {
 
   // Save AI settings when they change
   useEffect(() => {
-    localStorage.setItem('litreader_dark_mode', JSON.stringify(isDarkMode));
-  }, [isDarkMode]);
+    localStorage.setItem('litreader_target_lang', targetLang);
+  }, [targetLang]);
+
+  useEffect(() => {
+    localStorage.setItem('litreader_voice_id', voiceId);
+  }, [voiceId]);
+
+  useEffect(() => {
+    localStorage.setItem('litreader_trans_style', translationStyle);
+  }, [translationStyle]);
+
+  useEffect(() => {
+    localStorage.setItem('litreader_playback_rate', playbackRate.toString());
+  }, [playbackRate]);
+
+  useEffect(() => {
+    localStorage.setItem('litreader_ai_font_size', aiFontSize.toString());
+  }, [aiFontSize]);
 
   useEffect(() => {
     const settings = {
@@ -345,10 +940,11 @@ export default function App() {
       playbackRate,
       autoRead,
       isAudioEnabled,
-      isContinuousReading
+      isContinuousReading,
+      aiFontSize
     };
     localStorage.setItem('vogue_reader_ai_settings', JSON.stringify(settings));
-  }, [targetLang, voiceId, translationStyle, playbackRate, autoRead, isAudioEnabled, isContinuousReading]);
+  }, [targetLang, voiceId, translationStyle, playbackRate, autoRead, isAudioEnabled, isContinuousReading, aiFontSize]);
 
   // AI TTS Logic
   const stopTts = useCallback(() => {
@@ -379,9 +975,9 @@ export default function App() {
     });
     // Reset AI panel on page change
     setTranslatedText(null);
-    setSummaryText(null);
     setCurrentPageText(null);
     setAiError(null);
+    setIsServedFromCache(false);
     stopTts();
   }, [isSpreadView, numPages, stopTts]);
 
@@ -389,16 +985,15 @@ export default function App() {
     setPageNumber(Math.min(Math.max(1, page), numPages));
     // Reset AI panel on page change
     setTranslatedText(null);
-    setSummaryText(null);
     setCurrentPageText(null);
     setAiError(null);
+    setIsServedFromCache(false);
     stopTts();
   }, [numPages, stopTts]);
 
   // Clear cache when a new file is loaded
   useEffect(() => {
     translationCache.current = {};
-    summaryCache.current = {};
     ttsCache.current = {};
   }, [file]);
 
@@ -415,8 +1010,8 @@ export default function App() {
     let text = textToRead;
     if (!text) {
       if (aiMode === 'translation') text = translatedText || undefined;
-      else if (aiMode === 'summary') text = summaryText || undefined;
       else if (aiMode === 'reading') text = currentPageText || undefined;
+      else if (aiMode === 'advanced') text = translatedText || undefined;
     }
     
     if (!text && aiMode === 'reading' && !textToRead) {
@@ -473,10 +1068,20 @@ export default function App() {
     setAiSuggestion(null);
 
     // Check cache first
-    const cacheKey = `${voiceId}_${text.substring(0, 100)}_${text.length}`;
-    const cachedAudio = ttsCache.current[cacheKey];
+    const cacheKey = `audio_${user ? user.uid : 'guest'}_${voiceId}_${text.substring(0, 100)}_${text.length}`;
+    setCurrentTtsCacheKey(cacheKey);
+    
+    let cachedAudio = ttsCache.current[cacheKey];
+    if (!cachedAudio) {
+      const persistedAudio = await getCache(cacheKey);
+      if (persistedAudio) {
+        cachedAudio = persistedAudio;
+        ttsCache.current[cacheKey] = cachedAudio;
+      }
+    }
 
     const playAudio = (base64Data: string, offset = 0) => {
+      // Audio playback implementation remains largely unchanged here
       if (myPlayId !== currentPlayIdRef.current) return;
       
       const binary = atob(base64Data);
@@ -552,7 +1157,7 @@ export default function App() {
         for (let i = 0; i <= retries; i++) {
           try {
             return await ai.models.generateContent({
-              model: "gemini-2.5-pro-preview-tts",
+              model: "gemini-3.1-flash-tts-preview",
               contents: [{ parts: [{ text: `Đọc nội dung sau đây bằng ${voiceDescription}: ${text}` }] }],
               config: {
                 responseModalities: [Modality.AUDIO],
@@ -589,7 +1194,28 @@ export default function App() {
       const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
       if (base64Audio) {
         ttsCache.current[cacheKey] = base64Audio;
+        saveCache(cacheKey, base64Audio).catch(e => console.error("Audio cache save error:", e));
         playAudio(base64Audio);
+        
+        // Upload to Firebase if logged in
+        if (user && file) {
+          const persistenceKey = `vogue_reader_${file.name}_${file.size}`;
+          const storageRef = ref(storage, `users/${user.uid}/audio/${persistenceKey}_page_${pageNumber}_${voiceId}.mp3`);
+          
+          try {
+            await setDoc(doc(db, 'users', user.uid, 'audio', `${persistenceKey}_${pageNumber}_${voiceId}`), {
+              url: null, // downloadUrl (Storage not provisioned)
+              pageNumber,
+              voiceId,
+              textPreview: text.substring(0, 100),
+              timestamp: Date.now(),
+              bookId: persistenceKey,
+              bookName: file.name
+            });
+          } catch (cloudErr) {
+             console.error("Audio Firebase upload error", cloudErr);
+          }
+        }
       }
     } catch (error: any) {
       handleAiError(error, 'tts');
@@ -598,7 +1224,7 @@ export default function App() {
         setIsTtsLoading(false);
       }
     }
-  }, [aiMode, translatedText, summaryText, currentPageText, pageNumber, file, isTtsLoading, isAudioEnabled, isPlaying, stopTts, voiceId, playbackRate, changePage]);
+  }, [aiMode, translatedText, currentPageText, pageNumber, file, isTtsLoading, isAudioEnabled, isPlaying, stopTts, voiceId, playbackRate, changePage]);
 
   const seekTts = useCallback((seconds: number) => {
     if (!audioBufferRef.current || !audioContextRef.current) return;
@@ -643,6 +1269,38 @@ export default function App() {
     };
   }, [playbackRate, changePage]);
 
+  const handleDownloadAudio = async () => {
+    if (!file || !currentTtsCacheKey) return;
+    const base64Audio = ttsCache.current[currentTtsCacheKey];
+    if (base64Audio) {
+      try {
+        setIsAudioDownloading(true);
+        // Convert base64 to blob directly
+        const byteCharacters = atob(base64Audio);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) {
+          byteNumbers[i] = byteCharacters.charCodeAt(i);
+        }
+        const byteArray = new Uint8Array(byteNumbers);
+        const blob = new Blob([byteArray], {type: 'audio/mp3'});
+        
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = `Audio_${file.name.substring(0, 20)}_Page${pageNumber}.mp3`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+      } catch (err) {
+        console.error("Download failed:", err);
+      } finally {
+        setIsAudioDownloading(false);
+      }
+    }
+  };
+
   const loadLibrary = async () => {
     try {
       const files = await getAllFiles();
@@ -669,35 +1327,43 @@ export default function App() {
       if (user) {
         const { data: _, ...metadata } = savedFile;
         
-        // Upload to Storage
-        const fileRef = ref(storage, `users/${user.uid}/files/${persistenceKey}`);
-        await uploadBytes(fileRef, file);
+        // Upload to Storage (Storage not provisioned, so skip it)
+        // const fileRef = ref(storage, `users/${user.uid}/library/${persistenceKey}`);
+        // await uploadBytes(fileRef, file);
+        // const downloadURL = await getDownloadURL(fileRef);
         
-        // Save metadata to Firestore
-        await setDoc(doc(db, 'users', user.uid, 'files', persistenceKey), {
+        // Save metadata to Firestore library collection
+        await setDoc(doc(db, 'users', user.uid, 'library', persistenceKey), {
           ...metadata,
+          url: null, // downloadURL,
           ownerUid: user.uid
         });
       }
       
       await loadLibrary();
     } catch (err) {
-      console.error("Failed to save to library:", err);
+      if (user) {
+        handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}/library/${persistenceKey}`);
+      } else {
+        console.error("Failed to save to library:", err);
+      }
     } finally {
       setIsSaving(false);
     }
   };
 
   const handleDeleteFromLibrary = async (id: string) => {
+    if (isDeleting) return;
+    setIsDeleting(true);
     try {
       await deleteFile(id);
       
       // Sync to Firestore and Storage if logged in
       if (user) {
-        await deleteDoc(doc(db, 'users', user.uid, 'files', id));
+        await deleteDoc(doc(db, 'users', user.uid, 'library', id));
         try {
-          const fileRef = ref(storage, `users/${user.uid}/files/${id}`);
-          await deleteObject(fileRef);
+          // const fileRef = ref(storage, `users/${user.uid}/library/${id}`);
+          // await deleteObject(fileRef);
         } catch (storageErr) {
           console.error("Failed to delete from storage:", storageErr);
         }
@@ -709,8 +1375,16 @@ export default function App() {
         return updated;
       });
       await loadLibrary();
+      setDeleteConfirmId(null);
     } catch (err) {
-      console.error("Failed to delete from library:", err);
+      if (user) {
+        handleFirestoreError(err, OperationType.DELETE, `users/${user.uid}/library/${id}`);
+      } else {
+        console.error("Failed to delete from library:", err);
+        alert("Không thể xóa tài liệu. Vui lòng thử lại.");
+      }
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -722,28 +1396,18 @@ export default function App() {
     
     try {
       setIsDownloading(true);
-      const fileRef = ref(storage, `users/${user.uid}/files/${saved.id}`);
-      const url = await getDownloadURL(fileRef);
       
-      // Fetch the actual file data
-      const response = await fetch(url);
-      const blob = await response.blob();
+      // Since Storage is not provisioned, we can't download from the cloud URL.
+      alert("Tải file từ Cloud đang bị vô hiệu hóa vì Firebase Storage không được cấu hình. Ứng dụng hiện chỉ đọc file từ bộ nhớ đệm nội bộ.");
       
-      // Create a File object
-      const downloadedFile = new File([blob], saved.name, { type: 'application/pdf' });
-      
-      // Save it locally to IndexedDB
-      const newSavedFile = {
-        ...saved,
-        data: downloadedFile
-      };
-      await saveFile(newSavedFile);
-      
-      // Update local state
-      setSavedLibrary(prev => prev.map(f => f.id === saved.id ? newSavedFile : f));
-      
-      // Load it
-      await loadFromLibrary(newSavedFile);
+      const fileData = await getFile(saved.id);
+      if (fileData && fileData.data) {
+        setFile(fileData.data as File);
+        setIsDocumentLoaded(false);
+        setPageNumber(1);
+      } else {
+        alert("File này chưa có dữ liệu tại bộ nhớ đệm thiết bị.");
+      }
     } catch (err) {
       console.error("Failed to download from cloud:", err);
       alert("Không thể tải file từ Cloud. Có thể file đã bị xóa hoặc lỗi mạng.");
@@ -753,17 +1417,20 @@ export default function App() {
   };
 
   const loadFromLibrary = async (saved: SavedFile) => {
+    if (!saved.data) {
+      await downloadFromCloud(saved);
+      return;
+    }
+
     // Convert Blob back to File
     const loadedFile = new File([saved.data], saved.name, { type: 'application/pdf' });
     pdfDocRef.current = null;
     setFile(loadedFile);
     setPageNumber(1);
     setBookmarks([]);
-    setPageTimes({});
     setSearchQuery('');
     setSearchResults([]);
     setTranslatedText(null);
-    setSummaryText(null);
     setCurrentPageText(null);
     setIsDocumentLoaded(false);
     setIsAiPanelOpen(false);
@@ -831,10 +1498,6 @@ export default function App() {
 
     timerRef.current = setInterval(() => {
       setSessionTime(prev => prev + 1);
-      setPageTimes(prev => ({
-        ...prev,
-        [pageNumber]: (prev[pageNumber] || 0) + 1
-      }));
     }, 1000);
 
     return () => {
@@ -848,10 +1511,9 @@ export default function App() {
       const saved = localStorage.getItem(persistenceKey);
       if (saved) {
         try {
-          const { lastPage, savedBookmarks, savedPageTimes } = JSON.parse(saved);
+          const { lastPage, savedBookmarks } = JSON.parse(saved);
           if (lastPage) setPageNumber(lastPage);
           if (savedBookmarks) setBookmarks(savedBookmarks);
-          if (savedPageTimes) setPageTimes(savedPageTimes);
         } catch (e) {
           console.error("Failed to load saved state", e);
         }
@@ -862,23 +1524,26 @@ export default function App() {
   // Save state on changes and update history
   useEffect(() => {
     if (persistenceKey && file) {
+      const timestamp = Date.now();
       localStorage.setItem(persistenceKey, JSON.stringify({
         lastPage: pageNumber,
         savedBookmarks: bookmarks,
-        savedPageTimes: pageTimes
+        timestamp
       }));
 
       // Update history
+      let sessionReadingTime = 0;
       setReadingHistory(prev => {
         const existingItem = prev.find(item => item.id === persistenceKey);
         const previousTime = existingItem?.totalReadingTime || 0;
+        sessionReadingTime = previousTime;
         
         const newItem: HistoryItem = {
           id: persistenceKey,
           name: file.name,
           lastReadPage: pageNumber,
           totalPages: numPages,
-          timestamp: Date.now(),
+          timestamp,
           fileSize: file.size,
           totalReadingTime: previousTime
         };
@@ -887,8 +1552,25 @@ export default function App() {
         localStorage.setItem('vogue_reader_history', JSON.stringify(updated));
         return updated;
       });
+
+      // Sync progress to cloud if user is logged in
+      if (user) {
+        setDoc(doc(db, 'users', user.uid, 'progress', persistenceKey), {
+          id: persistenceKey,
+          lastPage: pageNumber,
+          savedBookmarks: bookmarks,
+          timestamp,
+          name: file.name,
+          totalPages: numPages,
+          fileSize: file.size,
+          totalReadingTime: sessionReadingTime
+        }).catch(err => {
+          console.error("Failed to sync progress to cloud:", err);
+          // Don't throw OperationType error here as it runs on every page turn and could crash the UI if flaky
+        });
+      }
     }
-  }, [pageNumber, bookmarks, persistenceKey, file, numPages]);
+  }, [pageNumber, bookmarks, persistenceKey, file, numPages, user]);
 
   // Refined timer update to history
   useEffect(() => {
@@ -914,11 +1596,9 @@ export default function App() {
       setFile(newFile);
       setPageNumber(1);
       setBookmarks([]);
-      setPageTimes({});
       setSearchQuery('');
       setSearchResults([]);
       setTranslatedText(null);
-      setSummaryText(null);
       setCurrentPageText(null);
       setIsDocumentLoaded(false);
       setIsAiPanelOpen(false);
@@ -926,13 +1606,39 @@ export default function App() {
       // Automatically save to library to ensure "Recently Read" works
       const key = `vogue_reader_${newFile.name}_${newFile.size}`;
       try {
-        await saveFile({
+        const newSavedFile = {
           id: key,
           name: newFile.name,
           data: newFile,
           timestamp: Date.now(),
           size: newFile.size
-        });
+        };
+        await saveFile(newSavedFile);
+        
+        // Auto-save to cloud if user is logged in
+        if (user) {
+          try {
+            setIsUploadingPdf(true);
+            const { data: _, ...metadata } = newSavedFile;
+            
+            // Upload to Storage (Storage not provisioned, skip)
+            // const fileRef = ref(storage, `users/${user.uid}/library/${key}`);
+            // await uploadBytes(fileRef, newFile);
+            // const downloadURL = await getDownloadURL(fileRef);
+            
+            // Save metadata and downloadURL to Firestore library collection
+            await setDoc(doc(db, 'users', user.uid, 'library', key), {
+              ...metadata,
+              url: null, // downloadURL,
+              ownerUid: user.uid
+            });
+          } catch (cloudErr) {
+            handleFirestoreError(cloudErr, OperationType.WRITE, `users/${user.uid}/library/${key}`);
+          } finally {
+            setIsUploadingPdf(false);
+          }
+        }
+        
         await loadLibrary();
         
         // Explicitly update history here as well to be safe
@@ -961,11 +1667,14 @@ export default function App() {
     setNumPages(pdf.numPages);
     pdfDocRef.current = pdf;
     setIsDocumentLoaded(true);
+    setBatchRange({ start: 1, end: Math.min(10, pdf.numPages) });
     try {
       const outline = await pdf.getOutline();
       setHasOutline(!!outline && outline.length > 0);
+      setPdfOutline(outline);
     } catch (e) {
       setHasOutline(false);
+      setPdfOutline(null);
     }
   }, []);
 
@@ -1044,39 +1753,53 @@ export default function App() {
     );
   }, [searchQuery]);
 
-  // Continuous Reading Logic
+  // Auto-play TTS Logic
   useEffect(() => {
-    if (isContinuousReading && isDocumentLoaded && currentPageText && !isPlaying && !isTtsLoading && aiMode === 'reading') {
-      // If we are in continuous mode and reading mode, start playing
+    if ((isContinuousReading || autoRead) && isDocumentLoaded && currentPageText && !isPlaying && !isTtsLoading && aiMode === 'reading') {
+      // Start playing if autoRead or continuous reading is enabled
       const timer = setTimeout(() => {
         playTts();
       }, 1000);
       return () => clearTimeout(timer);
     }
-  }, [pageNumber, isContinuousReading, isDocumentLoaded, currentPageText, aiMode, isPlaying, isTtsLoading, playTts]);
+  }, [pageNumber, isContinuousReading, autoRead, isDocumentLoaded, currentPageText, aiMode, isPlaying, isTtsLoading, playTts]);
 
   // Pre-extract text for the current page to speed up AI features
   useEffect(() => {
+    let mounted = true;
     const extractText = async () => {
-      if (!pdfDocRef.current || !pageNumber) return;
+      if (!pdfDocRef.current || !pageNumber || !file) return;
       try {
-        const page = await pdfDocRef.current.getPage(pageNumber);
+        // Use a local reference to ensure we're working with the same instance throughout the async flow
+        const currentPdf = pdfDocRef.current;
+        if (!currentPdf) return;
+        
+        const page = await currentPdf.getPage(pageNumber);
+        if (!mounted || currentPdf !== pdfDocRef.current) return;
+        
         const textContent = await page.getTextContent();
+        if (!mounted || currentPdf !== pdfDocRef.current) return;
+        
         const text = textContent.items.map((item: any) => item.str).join(' ');
-        setCurrentPageText(text);
-      } catch (err) {
-        console.error("Text extraction error:", err);
+        if (mounted) setCurrentPageText(text);
+      } catch (err: any) {
+        // Ignore internal transport errors that occur during unmounting or document swapping
+        if (err?.message?.includes('sendWithPromise') || err?.message?.includes('destroyed')) {
+          return;
+        }
+        console.warn("Text extraction warning:", err);
       }
     };
     extractText();
-  }, [pageNumber, file, isDocumentLoaded]); // Re-run when page, file or document load changes
+    return () => { mounted = false; };
+  }, [pageNumber, file, isDocumentLoaded]); 
 
   // AI Translation Logic
   const translatePage = useCallback(async () => {
     if (!file || isTranslating) return;
     
     // Check cache first
-    const cacheKey = `trans_${persistenceKey}_${pageNumber}_${targetLang}_${translationStyle}`;
+    const cacheKey = `trans_${user ? user.uid : 'guest'}_${persistenceKey}_${pageNumber}_${targetLang}_${translationStyle}`;
     
     // Check in-memory cache
     if (translationCache.current[cacheKey]) {
@@ -1084,9 +1807,7 @@ export default function App() {
       setIsAiPanelOpen(true);
       setAiError(null);
       setAiSuggestion(null);
-      if (autoRead && isAudioEnabled) {
-        setTimeout(() => playTts(translationCache.current[cacheKey]), 100);
-      }
+      setIsServedFromCache(true);
       return;
     }
 
@@ -1099,10 +1820,29 @@ export default function App() {
         setIsAiPanelOpen(true);
         setAiError(null);
         setAiSuggestion(null);
-        if (autoRead && isAudioEnabled) {
-          setTimeout(() => playTts(cached), 100);
-        }
+        setIsServedFromCache(true);
         return;
+      }
+
+      if (user) {
+        try {
+          const cloudDoc = await getDoc(doc(db, 'users', user.uid, 'translations', cacheKey));
+          if (cloudDoc.exists()) {
+            const data = cloudDoc.data();
+            if (data.text) {
+               translationCache.current[cacheKey] = data.text;
+               saveCache(cacheKey, data.text).catch(e => console.error("Cache sync error:", e));
+               setTranslatedText(data.text);
+               setIsAiPanelOpen(true);
+               setAiError(null);
+               setAiSuggestion(null);
+               setIsServedFromCache(true);
+               return;
+            }
+          }
+        } catch (cloudErr) {
+          handleFirestoreError(cloudErr, OperationType.GET, `users/${user.uid}/translations/${cacheKey}`);
+        }
       }
     } catch (err) {
       console.error("Cache read error:", err);
@@ -1113,6 +1853,7 @@ export default function App() {
     setTranslatedText(null);
     setAiError(null);
     setAiSuggestion(null);
+    setIsServedFromCache(false);
     stopTts();
 
     try {
@@ -1153,10 +1894,22 @@ export default function App() {
       });
 
       let fullText = "";
+      let lastSaveTime = Date.now();
       for await (const chunk of response) {
+        if (pageNumberRef.current !== pageNumber) {
+          // User navigated to another page, break stream to stop processing
+          break;
+        }
         const chunkText = chunk.text || "";
         fullText += chunkText;
         setTranslatedText(fullText);
+        
+        // Caching as we go (incremental save) every 2 seconds
+        if (Date.now() - lastSaveTime > 2000) {
+          translationCache.current[cacheKey] = fullText;
+          saveCache(cacheKey, fullText).catch(e => console.error("Incremental cache save error:", e));
+          lastSaveTime = Date.now();
+        }
       }
 
       const translated = fullText || "Không thể dịch nội dung.";
@@ -1165,13 +1918,12 @@ export default function App() {
       if (translated !== "Không thể dịch nội dung." && translated !== "Đã xảy ra lỗi khi dịch.") {
         translationCache.current[cacheKey] = translated;
         await saveCache(cacheKey, translated);
-      }
-
-      // Auto-read if enabled
-      if (autoRead && isAudioEnabled && translated !== "Không thể dịch nội dung.") {
-        setTimeout(() => {
-          playTts(translated);
-        }, 100);
+        if (user) {
+          setDoc(doc(db, 'users', user.uid, 'translations', cacheKey), {
+            text: translated,
+            timestamp: Date.now()
+          }).catch(e => handleFirestoreError(e, OperationType.WRITE, `users/${user.uid}/translations/${cacheKey}`));
+        }
       }
     } catch (error: any) {
       handleAiError(error, 'translation');
@@ -1181,122 +1933,14 @@ export default function App() {
     }
   }, [file, isTranslating, pageNumber, translationStyle, targetLang, stopTts, persistenceKey, autoRead, isAudioEnabled, playTts]);
 
-  // AI Summarization Logic
-  const summarizePage = useCallback(async () => {
-    if (!file || isSummarizing) return;
-
-    // Check cache first
-    const cacheKey = `summ_${persistenceKey}_${pageNumber}_${targetLang}`;
-    
-    // Check in-memory cache
-    if (summaryCache.current[cacheKey]) {
-      setSummaryText(summaryCache.current[cacheKey]);
-      setIsAiPanelOpen(true);
-      setAiMode('summary');
-      setAiError(null);
-      setAiSuggestion(null);
-      if (autoRead && isAudioEnabled) {
-        setTimeout(() => playTts(summaryCache.current[cacheKey]), 100);
-      }
-      return;
-    }
-
-    // Check persistent cache
-    try {
-      const cached = await getCache(cacheKey);
-      if (cached) {
-        summaryCache.current[cacheKey] = cached;
-        setSummaryText(cached);
-        setIsAiPanelOpen(true);
-        setAiMode('summary');
-        setAiError(null);
-        setAiSuggestion(null);
-        if (autoRead && isAudioEnabled) {
-          setTimeout(() => playTts(cached), 100);
-        }
-        return;
-      }
-    } catch (err) {
-      console.error("Cache read error:", err);
-    }
-
-    setIsAiPanelOpen(true);
-    setAiMode('summary');
-    setIsSummarizing(true);
-    setSummaryText(null);
-    setAiError(null);
-    setAiSuggestion(null);
-    stopTts();
-
-    try {
-      const ai = getGenAI();
-      let originalText = currentPageText;
-
-      // Fallback if currentPageText is not available yet
-      if (!originalText) {
-        let pdf = pdfDocRef.current;
-        if (!pdf && file) {
-          const data = await file.arrayBuffer();
-          pdf = await pdfjs.getDocument({ data }).promise;
-          pdfDocRef.current = pdf;
-        }
-        if (!pdf) throw new Error("Could not load PDF document.");
-        const page = await pdf.getPage(pageNumber);
-        const textContent = await page.getTextContent();
-        originalText = textContent.items.map((item: any) => item.str).join(' ');
-      }
-
-      if (!originalText) throw new Error("Could not extract text from page.");
-
-      const systemInstruction = `Bạn là một trợ lý đọc sách thông minh. Hãy tóm tắt nội dung của trang sách này một cách súc tích, nêu bật các ý chính bằng ${targetLang}. Trình bày dưới dạng các gạch đầu dòng nếu cần thiết.`;
-
-      const response = await ai.models.generateContentStream({
-        model: "gemini-3-flash-preview",
-        contents: `Tóm tắt nội dung sau đây bằng ${targetLang}: \n\n ${originalText}`,
-        config: {
-          systemInstruction
-        }
-      });
-
-      let fullText = "";
-      for await (const chunk of response) {
-        const chunkText = chunk.text || "";
-        fullText += chunkText;
-        setSummaryText(fullText);
-      }
-
-      const summary = fullText || "Không thể tóm tắt nội dung.";
-      
-      // Save to cache
-      if (summary !== "Không thể tóm tắt nội dung." && summary !== "Đã xảy ra lỗi khi tóm tắt.") {
-        summaryCache.current[cacheKey] = summary;
-        await saveCache(cacheKey, summary);
-      }
-
-      // Auto-read if enabled
-      if (autoRead && isAudioEnabled && summary !== "Không thể tóm tắt nội dung.") {
-        setTimeout(() => {
-          playTts(summary);
-        }, 100);
-      }
-    } catch (error: any) {
-      handleAiError(error, 'summary');
-      setSummaryText("Đã xảy ra lỗi khi tóm tắt.");
-    } finally {
-      setIsSummarizing(false);
-    }
-  }, [file, isSummarizing, pageNumber, targetLang, stopTts, persistenceKey, autoRead, isAudioEnabled, playTts]);
-
-  // Effect for Continuous Reading: Trigger translation when page changes
+  // Auto-translate/summarize on page change if panel is open
   useEffect(() => {
-    if (isContinuousReading && !translatedText && !summaryText && !isTranslating && !isSummarizing && file && isAiPanelOpen) {
-      if (aiMode === 'translation') {
+    if (isAiPanelOpen && !isTranslating && file) {
+      if (aiMode === 'translation' && !translatedText) {
         translatePage();
-      } else {
-        summarizePage();
       }
     }
-  }, [pageNumber, isContinuousReading, translatedText, summaryText, isTranslating, isSummarizing, file, isAiPanelOpen, aiMode, translatePage, summarizePage]);
+  }, [pageNumber, translatedText, isTranslating, file, isAiPanelOpen, aiMode, translatePage]);
 
   // Resize logic for AI Panel
   useEffect(() => {
@@ -1357,446 +2001,304 @@ export default function App() {
     };
   }, [isResizing]);
 
-  if (!file) {
-    return (
-      <div className={cn("min-h-screen bg-paper flex flex-col items-center justify-center p-6 overflow-hidden relative transition-colors duration-500", fontFamily, !isDarkMode && "light")}>
-        {/* Theme Toggle for Welcome Screen */}
-        <div className="absolute top-8 right-8 z-50">
-          <button 
-            onClick={() => setIsDarkMode(!isDarkMode)}
-            className="p-3 bg-ink/5 hover:bg-ink/10 text-ink rounded-full transition-all border border-ink/10 backdrop-blur-md"
-            title={isDarkMode ? "Switch to Light Mode" : "Switch to Dark Mode"}
-          >
-            {isDarkMode ? <Sun size={20} /> : <Moon size={20} />}
-          </button>
-        </div>
-
-        <div className="absolute inset-0 opacity-5 pointer-events-none overflow-hidden flex items-center justify-center">
-          <h1 className="text-[24vw] font-display uppercase leading-[0.82] -tracking-[0.02em] whitespace-nowrap rotate-[-10deg]">
-            LITREADER LITREADER
-          </h1>
-        </div>
-
-        <motion.div 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="relative z-10 flex flex-col items-center w-full max-w-4xl mx-auto gap-12"
-        >
-          <div className="text-center">
-            <span className="font-mono text-xs uppercase tracking-widest text-accent mb-6 block">
-              The Future of Digital Reading
-            </span>
-            <h2 className="text-7xl md:text-9xl font-display uppercase leading-[0.85] relative z-20">
-              LIT <br />
-              <span className="text-accent italic font-serif lowercase text-8xl md:text-[11rem] block mt-[-2rem]">Reader</span>
-            </h2>
-          </div>
-          
-          {/* Library and History Grid */}
-          {(savedLibrary.length > 0 || readingHistory.length > 0) && (
-            <div className="flex flex-col md:flex-row gap-6 w-full max-w-2xl justify-center bg-ink/5 p-6 rounded-3xl border border-ink/5 backdrop-blur-sm relative z-10 mt-[-6rem]">
-              {savedLibrary.length > 0 && (
-                <div className="flex-1">
-                  <h3 className="text-[10px] font-mono uppercase tracking-widest font-bold text-ink/40 mb-3 flex items-center gap-2">
-                    <LibraryIcon size={12} /> Your Library
-                  </h3>
-                  <div className="flex flex-col gap-2">
-                    {savedLibrary.slice(0, 2).map(saved => (
-                      <button 
-                        key={saved.id} 
-                        onClick={() => {
-                          if (saved.data) {
-                            loadFromLibrary(saved);
-                          } else {
-                            downloadFromCloud(saved);
-                          }
-                        }}
-                        className="flex items-center justify-between p-3 bg-paper/50 rounded-xl border border-ink/5 hover:border-accent/30 hover:bg-accent/5 transition-all text-left w-full group"
-                      >
-                        <span className="text-xs font-bold truncate max-w-[160px] group-hover:text-accent transition-colors">{saved.name}</span>
-                        <span className="text-[10px] font-mono text-ink/40">{(saved.size / 1024 / 1024).toFixed(1)} MB</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {readingHistory.length > 0 && (
-                <div className="flex-1">
-                  <h3 className="text-[10px] font-mono uppercase tracking-widest font-bold text-ink/40 mb-3 flex items-center gap-2">
-                    <History size={12} /> Recently Read
-                  </h3>
-                  <div className="flex flex-col gap-2">
-                    {readingHistory.slice(0, 2).map(item => (
-                      <button 
-                        key={item.id} 
-                        onClick={() => handleOpenFromHistory(item)}
-                        className="flex items-center justify-between p-3 bg-paper/50 rounded-xl border border-ink/5 hover:border-accent/30 hover:bg-accent/5 transition-all text-left w-full group"
-                      >
-                        <span className="text-xs font-bold truncate max-w-[160px] group-hover:text-accent transition-colors">{item.name}</span>
-                        <span className="text-[10px] font-mono text-ink/40 shrink-0">Pg {item.lastReadPage}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          <div className="flex flex-col items-center gap-4 relative z-30">
-            <label className="group relative cursor-pointer overflow-hidden bg-accent text-paper px-10 py-4 rounded-full transition-all hover:scale-105 active:scale-95 shadow-[0_0_30px_var(--color-accent-glow)] hover:shadow-[0_0_50px_var(--color-accent-glow-hover)]">
-              <input type="file" className="hidden" accept=".pdf" onChange={onFileChange} />
-              <div className="flex items-center gap-3 font-bold uppercase tracking-wider text-sm">
-                <Upload size={18} />
-                <span>Upload</span>
-              </div>
-            </label>
-            <p className="text-ink/30 font-mono text-[10px] uppercase tracking-widest">Supported format: PDF</p>
-          </div>
-        </motion.div>
-
-        <div className="absolute bottom-8 left-8 right-8 flex justify-between items-end pointer-events-none hidden md:flex">
-          <div className="max-w-xs">
-            <p className="text-[10px] font-mono uppercase tracking-widest font-bold text-ink/30 mb-2">About</p>
-            <p className="text-xs font-mono text-ink/50 leading-relaxed">
-              A curated digital experience designed for the modern GenZ enthusiast. 
-              Immersive, precise, and beautifully rendered.
-            </p>
-          </div>
-          <div className="flex gap-12">
-            <div className="text-right">
-              <p className="text-[10px] font-mono uppercase tracking-widest font-bold text-ink/30 mb-1">Issue</p>
-              <p className="text-2xl font-display uppercase leading-none">No. 01</p>
-            </div>
-            <div className="text-right">
-              <p className="text-[10px] font-mono uppercase tracking-widest font-bold text-ink/30 mb-1">Year</p>
-              <p className="text-2xl font-display uppercase leading-none">2026</p>
-            </div>
-          </div>
-        </div>
-
-        {isDownloading && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center bg-paper/80 backdrop-blur-sm">
-            <div className="flex flex-col items-center gap-4">
-              <Loader2 size={32} className="animate-spin text-accent" />
-              <p className="font-mono text-xs uppercase tracking-widest font-bold text-accent">Downloading from Cloud...</p>
-            </div>
-          </div>
-        )}
-      </div>
-    );
-  }
-
   return (
     <ErrorBoundary>
       <div className={cn("h-screen bg-paper flex flex-col overflow-hidden transition-colors duration-500", fontFamily, !isDarkMode && "light")}>
       {/* Header */}
-      <header className="h-16 border-b border-ink/10 flex items-center justify-between px-6 z-50 bg-paper/80 backdrop-blur-md">
-        <div className="flex items-center gap-4">
-          <button 
-            onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-            className="p-2 hover:bg-ink/5 rounded-full transition-colors"
-          >
-            {isSidebarOpen ? <X size={20} /> : <Menu size={20} />}
-          </button>
-          <div className="h-4 w-[1px] bg-ink/10 mx-2" />
-          <h1 className="font-display uppercase text-xl tracking-tighter">LITREADER</h1>
-          
-          <div className="hidden lg:flex items-center gap-2 ml-4 bg-ink/5 rounded-full px-2 py-1">
-            <button
-              onClick={() => setFontFamily('font-sans')}
-              className={cn("px-3 py-1 text-xs font-bold rounded-full transition-colors", fontFamily === 'font-sans' ? "bg-ink text-paper" : "hover:bg-ink/10")}
-            >
-              Sans
-            </button>
-            <button
-              onClick={() => setFontFamily('font-serif')}
-              className={cn("px-3 py-1 text-xs font-bold rounded-full transition-colors", fontFamily === 'font-serif' ? "bg-ink text-paper" : "hover:bg-ink/10")}
-            >
-              Serif
-            </button>
-            <button
-              onClick={() => setFontFamily('font-mono')}
-              className={cn("px-3 py-1 text-xs font-bold rounded-full transition-colors", fontFamily === 'font-mono' ? "bg-ink text-paper" : "hover:bg-ink/10")}
-            >
-              Mono
-            </button>
-          </div>
+      <header className="h-14 border-b border-ink/10 flex items-center justify-between px-4 z-50 bg-paper/80 backdrop-blur-md">
+        <div className="flex items-center gap-2">
+          {file && (
+            <>
+              <button 
+                onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+                className="p-1.5 hover:bg-ink/5 text-ink rounded-full transition-colors"
+                title={isSidebarOpen ? "Close sidebar" : "Open sidebar"}
+              >
+                {isSidebarOpen ? <X size={18} /> : <Menu size={18} />}
+              </button>
+              <div className="h-4 w-[1px] bg-ink/10 mx-1" />
+            </>
+          )}
+          <h1 className="font-display uppercase text-xl tracking-tight font-black text-accent">LIT.</h1>
+          {isUploadingPdf && (
+            <div className="flex items-center gap-1.5 ml-2 animate-pulse">
+               <Loader2 size={12} className="text-accent animate-spin" />
+               <span className="text-[8px] font-black uppercase tracking-tighter text-accent">SYNCING...</span>
+            </div>
+          )}
         </div>
 
         {/* Search Bar */}
-        <form onSubmit={handleSearch} className="flex-1 max-w-md mx-2 sm:mx-8 relative">
-          <div className="relative flex items-center">
-            <Search size={16} className="absolute left-4 text-ink/40" />
-            <input 
-              type="text"
-              placeholder="Tìm..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full bg-ink/5 border-none rounded-full py-2 pl-10 pr-4 text-sm focus:ring-2 focus:ring-accent/20 transition-all"
-            />
-            {isSearching && (
-              <div className="absolute right-4 w-4 h-4 border-2 border-accent border-t-transparent rounded-full animate-spin" />
-            )}
-          </div>
-          {searchResults.length > 0 && (
-            <div className="absolute top-full mt-2 left-0 right-0 bg-paper border border-ink/10 rounded-xl shadow-xl p-2 flex items-center justify-between z-50">
-              <span className="text-xs font-mono px-2">
-                {currentSearchIndex + 1}/{searchResults.length}
-              </span>
-              <div className="flex gap-1">
-                <button 
-                  type="button"
-                  onClick={() => navigateSearch('prev')}
-                  className="p-1.5 hover:bg-ink/5 rounded-lg transition-colors"
-                >
-                  <ChevronLeft size={14} />
-                </button>
-                <button 
-                  type="button"
-                  onClick={() => navigateSearch('next')}
-                  className="p-1.5 hover:bg-ink/5 rounded-lg transition-colors"
-                >
-                  <ChevronRight size={14} />
-                </button>
-                <button 
-                  type="button"
-                  onClick={() => {setSearchResults([]); setSearchQuery('');}}
-                  className="p-1.5 hover:bg-ink/5 rounded-lg transition-colors text-ink/40"
-                >
-                  <X size={14} />
-                </button>
-              </div>
-            </div>
-          )}
-        </form>
-
-        <div className="flex items-center gap-2 sm:gap-4">
-          <button 
-            onClick={() => {
-              setAiMode('reading');
-              setIsAiPanelOpen(true);
-              setAiError(null);
-              setAiSuggestion(null);
-              playTts();
-            }}
-            className={cn(
-              "p-2 rounded-full transition-all flex items-center gap-2 px-3 sm:px-4 border shadow-sm",
-              isAiPanelOpen && aiMode === 'reading'
-                ? "text-paper bg-accent border-accent shadow-[0_0_20px_var(--color-accent-glow)]" 
-                : "bg-surface text-ink border-ink/10 hover:border-accent/50 hover:text-accent"
-            )}
-            title="Read original text"
-          >
-            <PlayCircle size={18} />
-            <span className="text-[10px] uppercase font-black tracking-widest hidden sm:inline">Đọc</span>
-          </button>
-
-          <button 
-            onClick={() => {
-              setAiError(null);
-              setAiSuggestion(null);
-              translatePage();
-            }}
-            className={cn(
-              "p-2 rounded-full transition-all flex items-center gap-2 px-3 sm:px-4 border shadow-md group relative overflow-hidden",
-              isAiPanelOpen && aiMode === 'translation' 
-                ? "text-paper bg-accent border-accent shadow-[0_0_20px_var(--color-accent-glow)]" 
-                : "bg-surface text-ink border-ink/10 hover:border-accent/50 hover:text-accent"
-            )}
-            title="Translate to Vietnamese"
-          >
-            <motion.div
-              animate={{ 
-                scale: [1, 1.2, 1],
-                rotate: [0, 10, -10, 0]
-              }}
-              transition={{ 
-                duration: 2, 
-                repeat: Infinity,
-                ease: "easeInOut"
-              }}
-            >
-              <Sparkles size={18} />
-            </motion.div>
-            <span className="text-[10px] uppercase font-black tracking-widest hidden sm:inline">Dịch</span>
-            <div className="absolute inset-0 bg-ink/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300" />
-          </button>
-
-          <button 
-            onClick={() => {
-              setAiError(null);
-              setAiSuggestion(null);
-              summarizePage();
-            }}
-            className={cn(
-              "p-2 rounded-full transition-all flex items-center gap-2 px-3 border shadow-sm",
-              isAiPanelOpen && aiMode === 'summary' 
-                ? "text-paper bg-accent border-accent shadow-[0_0_20px_var(--color-accent-glow)]" 
-                : "bg-surface text-ink border-ink/10 hover:border-accent/50 hover:text-accent"
-            )}
-            title="Summarize current page"
-          >
-            <LayoutGrid size={18} />
-            <span className="text-[10px] uppercase font-bold tracking-widest hidden sm:inline">TÓM TẮT</span>
-          </button>
-
-          <button 
-            onClick={() => setIsSpreadView(!isSpreadView)}
-            className={cn(
-              "p-2 rounded-full transition-all flex items-center gap-2 px-3 border shadow-sm hidden md:flex",
-              isSpreadView 
-                ? "text-paper bg-accent border-accent shadow-[0_0_20px_var(--color-accent-glow)]" 
-                : "bg-surface text-ink border-ink/10 hover:border-accent/50 hover:text-accent"
-            )}
-            title="Toggle Spread View"
-          >
-            {isSpreadView ? <Columns size={18} /> : <Square size={18} />}
-          </button>
-
-          <button 
-            onClick={toggleBookmark}
-            className={cn(
-              "p-2 rounded-full transition-all border shadow-sm hidden sm:flex",
-              bookmarks.includes(pageNumber) 
-                ? "text-paper bg-accent border-accent shadow-[0_0_20px_var(--color-accent-glow)]" 
-                : "bg-surface text-ink border-ink/10 hover:border-accent/50 hover:text-accent"
-            )}
-          >
-            {bookmarks.includes(pageNumber) ? <Bookmark size={20} fill="currentColor" /> : <BookmarkPlus size={20} />}
-          </button>
-
-          <div className="hidden sm:flex items-center gap-2 bg-ink/5 px-4 py-1.5 rounded-full">
-            <button 
-              onClick={() => changePage(-1)}
-              disabled={pageNumber <= 1}
-              className="disabled:opacity-20 hover:text-accent transition-colors p-1"
-            >
-              <ChevronLeft size={18} />
-            </button>
-            <div className="flex items-center gap-1">
+        {file && (
+          <form onSubmit={handleSearch} className="flex-1 max-w-md mx-2 sm:mx-8 relative">
+            <div className="relative flex items-center">
+              <Search size={16} className="absolute left-4 text-ink/40" />
               <input 
                 type="text"
-                defaultValue={pageNumber}
-                key={pageNumber}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    const val = parseInt((e.target as HTMLInputElement).value);
-                    if (!isNaN(val)) {
-                      goToPage(val);
-                    }
-                  }
-                }}
-                onBlur={(e) => {
-                  const val = parseInt(e.target.value);
-                  if (!isNaN(val)) {
-                    goToPage(val);
-                  }
-                }}
-                className="w-10 bg-transparent text-sm font-mono font-bold text-center focus:outline-none focus:ring-1 focus:ring-accent/30 rounded"
+                placeholder="Tìm..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-ink/5 border-none rounded-full py-2 pl-10 pr-4 text-sm focus:ring-2 focus:ring-accent/20 transition-all"
               />
-              <span className="text-sm font-mono font-medium text-ink/40">/ {numPages}</span>
+              {isSearching && (
+                <div className="absolute right-4 w-4 h-4 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+              )}
             </div>
-            <button 
-              onClick={() => changePage(1)}
-              disabled={pageNumber >= numPages || (isSpreadView && pageNumber + 1 >= numPages)}
-              className="disabled:opacity-20 hover:text-accent transition-colors p-1"
-            >
-              <ChevronRight size={18} />
-            </button>
-          </div>
-
-          <div className="hidden xl:flex items-center gap-3 bg-ink/5 px-4 py-1.5 rounded-full">
-            <ZoomOut size={14} className="text-ink/40" />
-            <input 
-              type="range" 
-              min="0.5" 
-              max="2.5" 
-              step="0.1" 
-              value={scale} 
-              onChange={(e) => setScale(parseFloat(e.target.value))}
-              className="w-24 h-1 bg-ink/10 rounded-lg appearance-none cursor-pointer accent-accent"
-            />
-            <ZoomIn size={14} className="text-ink/40" />
-            <button 
-              onClick={() => setScale(1.0)}
-              className="text-[10px] font-mono font-bold w-8 hover:text-accent transition-colors"
-              title="Reset Zoom"
-            >
-              {Math.round(scale * 100)}%
-            </button>
-          </div>
-
-          <button 
-            onClick={handleSaveToLibrary}
-            disabled={isSaving || savedLibrary.some(s => s.id === persistenceKey)}
-            className={cn(
-              "p-2 rounded-full transition-all flex items-center gap-2 px-3 border border-ink/10 shadow-sm hidden lg:flex",
-              savedLibrary.some(s => s.id === persistenceKey) 
-                ? "text-green-500 bg-green-500/10 border-green-500/30" 
-                : "hover:bg-accent/10 hover:border-accent/30 text-ink/80"
+            {searchResults.length > 0 && (
+              <div className="absolute top-full mt-2 left-0 right-0 bg-paper border border-ink/10 rounded-xl shadow-xl p-2 flex items-center justify-between z-50">
+                <span className="text-xs font-mono px-2">
+                  {currentSearchIndex + 1}/{searchResults.length}
+                </span>
+                <div className="flex gap-1">
+                  <button 
+                    type="button"
+                    onClick={() => navigateSearch('prev')}
+                    className="p-1.5 hover:bg-ink/5 text-ink rounded-lg transition-colors"
+                  >
+                    <ChevronLeft size={14} />
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={() => navigateSearch('next')}
+                    className="p-1.5 hover:bg-ink/5 text-ink rounded-lg transition-colors"
+                  >
+                    <ChevronRight size={14} />
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={() => {setSearchResults([]); setSearchQuery('');}}
+                    className="p-1.5 hover:bg-ink/5 rounded-lg transition-colors text-ink/40"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              </div>
             )}
-            title="Save to Library"
-          >
-            {isSaving ? <Loader2 size={18} className="animate-spin" /> : <Save size={18} />}
-            <span className="text-[10px] uppercase font-bold tracking-widest">
-              {savedLibrary.some(s => s.id === persistenceKey) ? "Saved" : "Save"}
-            </span>
-          </button>
+          </form>
+        )}
+
+        <div className="flex items-center gap-2">
+          {file && (
+            <>
+              <button 
+                onClick={() => {
+                  setAiMode('reading');
+                  setIsAiPanelOpen(true);
+                  setAiError(null);
+                  setAiSuggestion(null);
+                  playTts();
+                }}
+                className={cn(
+                  "p-1.5 rounded-lg transition-all flex items-center gap-1.5 px-2.5 border shadow-sm",
+                  isAiPanelOpen && aiMode === 'reading'
+                    ? "text-paper bg-accent border-accent shadow-[0_0_15px_var(--color-accent-glow)]" 
+                    : "bg-surface text-ink border-ink/10 hover:border-accent/50 hover:text-accent"
+                )}
+                title="Read original text"
+              >
+                <PlayCircle size={16} />
+                <span className="text-[9px] uppercase font-black tracking-widest hidden sm:inline">ĐỌC</span>
+              </button>
+
+              <button 
+                onClick={() => {
+                  setAiError(null);
+                  setAiSuggestion(null);
+                  translatePage();
+                }}
+                className={cn(
+                  "p-1.5 rounded-lg transition-all flex items-center gap-1.5 px-2.5 border shadow-sm group relative overflow-hidden",
+                  isAiPanelOpen && aiMode === 'translation' 
+                    ? "text-paper bg-accent border-accent shadow-[0_0_15px_var(--color-accent-glow)]" 
+                    : "bg-surface text-ink border-ink/10 hover:border-accent/50 hover:text-accent"
+                )}
+                title="Translate to Vietnamese"
+              >
+                <Sparkles size={16} />
+                <span className="text-[9px] uppercase font-black tracking-widest hidden sm:inline">DỊCH</span>
+              </button>
+
+              <div className="h-4 w-[1px] bg-ink/10 mx-1" />
+            </>
+          )}
 
           <button 
             onClick={() => setIsDarkMode(!isDarkMode)}
-            className="p-2 hover:bg-ink/5 rounded-full transition-colors"
+            className="p-1.5 hover:bg-ink/5 text-ink rounded-lg transition-colors"
             title={isDarkMode ? "Switch to Light Mode" : "Switch to Dark Mode"}
           >
-            {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+            {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
           </button>
 
-          <button 
-            onClick={toggleFullScreen}
-            className="p-2 hover:bg-ink/5 rounded-full transition-colors hidden sm:flex"
-          >
-            {isFullScreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
-          </button>
+          {file && (
+            <button 
+              onClick={toggleFullScreen}
+              className="p-1.5 hover:bg-ink/5 text-ink rounded-lg transition-colors hidden sm:flex"
+            >
+              {isFullScreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+            </button>
+          )}
 
-          <div className="h-4 w-[1px] bg-ink/10 mx-2" />
+          <div className="h-4 w-[1px] bg-ink/10 mx-1" />
 
           {user ? (
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
               <img 
                 src={user.photoURL || `https://ui-avatars.com/api/?name=${user.displayName || 'User'}`} 
                 alt="Profile" 
-                className="w-8 h-8 rounded-full border border-ink/10"
+                className="w-6 h-6 rounded-lg border border-ink/10"
               />
               <button 
                 onClick={logout}
-                className="text-[10px] uppercase font-bold tracking-widest text-ink/40 hover:text-accent transition-colors"
+                className="text-[9px] uppercase font-black tracking-widest text-ink/40 hover:text-accent transition-colors"
               >
-                Logout
+                OUT
               </button>
             </div>
           ) : (
             <button 
               onClick={signInWithGoogle}
               disabled={isAuthLoading}
-              className="flex items-center gap-2 px-4 py-2 bg-ink text-paper rounded-full text-[10px] uppercase font-bold tracking-widest hover:bg-accent transition-all shadow-sm"
+              className="flex items-center gap-1.5 px-3.5 py-2 bg-ink text-paper rounded-xl text-[9px] uppercase font-black tracking-widest hover:bg-accent transition-all shadow-sm"
             >
-              {isAuthLoading ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
-              Login
+              {isAuthLoading ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
+              IN
             </button>
           )}
           
-          <button 
-            onClick={() => setFile(null)}
-            className="text-xs uppercase tracking-widest font-bold text-accent hover:underline ml-2"
-          >
-            Đóng
-          </button>
+          {file && (
+            <button 
+              onClick={() => setFile(null)}
+              className="flex items-center gap-1.5 px-2 py-1.5 bg-ink/5 hover:bg-red-500/10 hover:text-red-500 rounded-lg text-[9px] uppercase font-black tracking-widest transition-all ml-1"
+            >
+              <X size={12} />
+            </button>
+          )}
         </div>
       </header>
 
       <div className="flex-1 flex overflow-hidden relative">
-        {/* Sidebar */}
+        {!file ? (
+          <div className={cn("flex-1 bg-paper flex flex-col items-center justify-start p-6 overflow-y-auto relative transition-colors duration-500", fontFamily, !isDarkMode && "light")}>
+            <motion.div 
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="w-full max-w-3xl mx-auto flex flex-col items-center gap-10 mt-12"
+            >
+              {/* Drag & drop upload area */}
+              <div className="w-full">
+                <label 
+                  onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (isUploadingPdf) return;
+                    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                      const fakeEvent = { target: { files: e.dataTransfer.files } } as any;
+                      onFileChange(fakeEvent);
+                    }
+                  }}
+                  className={cn(
+                    "group relative cursor-pointer flex flex-col items-center justify-center w-full p-12 lg:p-16 border-2 border-dashed border-ink/20 rounded-[2rem] bg-ink/5 hover:bg-ink/10 hover:border-accent/40 transition-all text-center",
+                    isUploadingPdf && "pointer-events-none opacity-60"
+                  )}
+                >
+                  <input type="file" className="hidden" accept=".pdf" onChange={onFileChange} disabled={isUploadingPdf} />
+                  {isUploadingPdf ? (
+                    <div className="flex flex-col items-center">
+                       <Loader2 size={32} className="text-accent animate-spin mb-4" />
+                       <h3 className="text-xl font-bold text-ink mb-2 tracking-tight">Đang tải lên Cloud...</h3>
+                       <p className="text-sm text-ink/60 font-medium">Vui lòng chờ trong giây lát</p>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="w-16 h-16 rounded-2xl bg-paper shadow hover:shadow-md flex items-center justify-center text-accent mb-4 group-hover:scale-110 transition-transform">
+                        <UploadCloud size={32} />
+                      </div>
+                      <h3 className="text-xl font-bold text-ink mb-2 tracking-tight">Kéo thả file PDF vào đây</h3>
+                      <p className="text-sm text-ink/60 font-medium">hoặc click để chọn file từ máy tính</p>
+                    </>
+                  )}
+                </label>
+              </div>
+
+              {/* Library & Reading History */}
+              {(savedLibrary.length > 0 || readingHistory.length > 0) && (
+                <div className="w-full flex-col gap-8 flex pb-12">
+                  {readingHistory.length > 0 && (
+                    <div className="flex-1">
+                      <h3 className="text-sm font-bold text-ink/80 mb-4 flex items-center gap-2 uppercase tracking-wide">
+                        <History size={16} /> Đọc gần đây
+                      </h3>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {readingHistory.slice(0, 4).map(item => (
+                          <button 
+                            key={item.id} 
+                            onClick={() => handleOpenFromHistory(item)}
+                            className="flex items-center gap-4 p-4 bg-paper rounded-2xl border border-ink/10 hover:border-ink/20 hover:bg-ink/5 transition-all text-left w-full group shadow-sm shadow-ink/5"
+                          >
+                            <div className="w-12 h-12 rounded-xl bg-ink/5 flex items-center justify-center shrink-0 text-ink/50 group-hover:text-accent group-hover:bg-accent/10 transition-colors">
+                              <FileText size={24} />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <h4 className="text-base font-bold text-ink truncate font-sans">{item.name}</h4>
+                              <span className="text-xs text-ink/60 mt-0.5 block">Đang đọc...</span>
+                            </div>
+                            <div className="shrink-0 pl-2">
+                               <span className="text-xs font-bold text-ink/80 bg-ink/5 px-2.5 py-1.5 rounded-lg group-hover:bg-accent/10 group-hover:text-accent transition-colors">Pg {item.lastReadPage}</span>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {savedLibrary.length > 0 && (
+                    <div className="flex-1 mt-4">
+                      <h3 className="text-sm font-bold text-ink/80 mb-4 flex items-center gap-2 uppercase tracking-wide">
+                        <LibraryIcon size={16} /> Thư viện của tôi
+                      </h3>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {savedLibrary.slice(0, 4).map(saved => (
+                          <button 
+                            key={saved.id} 
+                            onClick={() => {
+                              if (saved.data) {
+                                loadFromLibrary(saved);
+                              } else {
+                                downloadFromCloud(saved);
+                              }
+                            }}
+                            className="flex items-center gap-4 p-4 bg-paper rounded-2xl border border-ink/10 hover:border-ink/20 hover:bg-ink/5 transition-all text-left w-full group shadow-sm shadow-ink/5"
+                          >
+                            <div className="w-12 h-12 rounded-xl bg-ink/5 flex items-center justify-center shrink-0 text-ink/50 group-hover:text-accent group-hover:bg-accent/10 transition-colors">
+                              <FileText size={24} />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <h4 className="text-base font-bold text-ink truncate font-sans">{saved.name}</h4>
+                              <span className="text-xs text-ink/60 mt-0.5 block">{(saved.size / 1024 / 1024).toFixed(1)} MB</span>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </motion.div>
+
+            {isDownloading && (
+              <div className="absolute inset-0 z-50 flex items-center justify-center bg-paper/80 backdrop-blur-sm">
+                <div className="flex flex-col items-center gap-4">
+                  <Loader2 size={32} className="animate-spin text-accent" />
+                  <p className="font-mono text-xs uppercase tracking-widest font-bold text-accent">Downloading from Cloud...</p>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <>
+            {/* Sidebar */}
         <AnimatePresence>
           {isSidebarOpen && (
             <motion.aside 
@@ -1887,32 +2389,68 @@ export default function App() {
                     {bookmarks.length === 0 ? (
                       <div className="text-center py-12">
                         <Bookmark size={32} className="mx-auto text-ink/10 mb-4" />
-                        <p className="text-sm font-serif italic text-ink/40">No bookmarks yet</p>
+                        <p className="text-sm font-serif italic text-ink/40">Chưa có dấu trang</p>
                       </div>
                     ) : (
-                      <div className="grid grid-cols-2 gap-4">
-                        {bookmarks.map((page) => (
-                          <button
-                            key={`bookmark_${page}`}
-                            onClick={() => setPageNumber(page)}
-                            className={cn(
-                              "group relative aspect-[3/4] bg-ink/5 rounded-sm overflow-hidden transition-all",
-                              pageNumber === page && "ring-2 ring-accent ring-offset-2"
-                            )}
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between">
+                          <h3 className="text-[10px] font-black uppercase tracking-widest text-ink/40">Dấu trang ({bookmarks.length})</h3>
+                          <button 
+                            onClick={translateAllBookmarks}
+                            className="bg-accent/10 text-accent text-[9px] font-bold px-2 py-1 rounded hover:bg-accent/20 transition-all flex items-center gap-1"
                           >
-                            <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 bg-ink/40 transition-opacity z-10">
-                              <span className="text-paper font-mono text-xs">{page}</span>
-                            </div>
-                            <Document file={file}>
-                              <Page 
-                                pageNumber={page} 
-                                width={140} 
-                                renderAnnotationLayer={false}
-                                renderTextLayer={false}
-                              />
-                            </Document>
+                            <Sparkles size={10} />
+                            Dịch tất cả
                           </button>
-                        ))}
+                        </div>
+                        <div className="grid grid-cols-2 gap-4">
+                          {bookmarks.map((page) => (
+                            <div key={`bookmark_container_${page}`} className="space-y-2">
+                              <button
+                                onClick={() => setPageNumber(page)}
+                                className={cn(
+                                  "group relative aspect-[3/4] bg-ink/5 rounded-sm overflow-hidden transition-all w-full",
+                                  pageNumber === page && "ring-2 ring-accent ring-offset-2"
+                                )}
+                              >
+                                <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 bg-ink/40 transition-opacity z-10">
+                                  <span className="text-paper font-mono text-xs">{page}</span>
+                                </div>
+                                <Document file={file}>
+                                  <Page 
+                                    pageNumber={page} 
+                                    width={140} 
+                                    renderAnnotationLayer={false}
+                                    renderTextLayer={false}
+                                    devicePixelRatio={1}
+                                  />
+                                </Document>
+                              </button>
+                              
+                              <div className="bg-ink/5 rounded-lg p-2 min-h-[40px] relative group/trans">
+                                {isTranslatingBookmarks[page] ? (
+                                  <div className="flex items-center justify-center p-2">
+                                    <Loader2 size={12} className="animate-spin text-accent" />
+                                  </div>
+                                ) : bookmarkTranslations[page] ? (
+                                  <div className="text-[10px] text-ink/70 line-clamp-3 font-serif">
+                                    {bookmarkTranslations[page]}
+                                  </div>
+                                ) : (
+                                  <button 
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      translateBookmarkPage(page);
+                                    }}
+                                    className="w-full py-1 text-[8px] font-bold text-accent hover:underline uppercase tracking-wider"
+                                  >
+                                    Xem bản dịch
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -1965,11 +2503,17 @@ export default function App() {
                     {savedLibrary.length === 0 ? (
                       <div className="text-center py-12">
                         <LibraryIcon size={32} className="mx-auto text-ink/10 mb-4" />
-                        <p className="text-sm font-serif italic text-ink/40">Library is empty</p>
+                        <p className="text-sm font-serif italic text-ink/40">Thư viện trống</p>
                       </div>
                     ) : (
                       savedLibrary.map((saved) => (
-                        <div key={saved.id} className="group p-3 bg-ink/5 rounded-xl border border-ink/5 hover:border-accent/20 transition-all relative">
+                        <div 
+                          key={saved.id} 
+                          className={cn(
+                            "group p-3 bg-ink/5 rounded-xl border transition-all relative",
+                            file?.name === saved.name ? "border-accent/40 bg-accent/5" : "border-ink/5 hover:border-accent/20"
+                          )}
+                        >
                           <div 
                             className="cursor-pointer"
                             onClick={() => {
@@ -1980,7 +2524,24 @@ export default function App() {
                               }
                             }}
                           >
-                            <p className="text-sm font-bold truncate mb-1 pr-6 group-hover:text-accent transition-colors">{saved.name}</p>
+                            <div className="flex items-start justify-between gap-2 mb-2">
+                              <p className={cn(
+                                "text-sm font-bold truncate transition-colors pr-1",
+                                file?.name === saved.name ? "text-accent" : "group-hover:text-accent"
+                              )}>
+                                {saved.name}
+                              </p>
+                              <button 
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setDeleteConfirmId(saved.id);
+                                }}
+                                className="p-1.5 text-ink/20 hover:text-destructive transition-all opacity-0 group-hover:opacity-100 shrink-0 bg-ink/5 rounded-lg hover:bg-destructive/10"
+                                title="Xóa tài liệu"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2">
                                 <span className="text-[10px] font-mono text-ink/40">{(saved.size / 1024 / 1024).toFixed(2)} MB</span>
@@ -1991,15 +2552,6 @@ export default function App() {
                               <span className="text-[10px] text-ink/30 italic">{new Date(saved.timestamp).toLocaleDateString()}</span>
                             </div>
                           </div>
-                          <button 
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleDeleteFromLibrary(saved.id);
-                            }}
-                            className="absolute top-3 right-3 text-ink/20 hover:text-destructive transition-colors opacity-0 group-hover:opacity-100"
-                          >
-                            <Trash2 size={14} />
-                          </button>
                         </div>
                       ))
                     )}
@@ -2057,6 +2609,7 @@ export default function App() {
                   renderTextLayer={true}
                   customTextRenderer={textRenderer}
                   onRenderSuccess={() => setIsPageRendering(false)}
+                  devicePixelRatio={renderQuality === 'high' ? Math.min(2, window.devicePixelRatio || 1) : 1}
                 />
               </Document>
             </motion.div>
@@ -2080,6 +2633,7 @@ export default function App() {
                     renderTextLayer={true}
                     customTextRenderer={textRenderer}
                     onRenderSuccess={() => setIsPageRendering(false)}
+                    devicePixelRatio={renderQuality === 'high' ? Math.min(2, window.devicePixelRatio || 1) : 1}
                   />
                 </Document>
               </motion.div>
@@ -2126,11 +2680,119 @@ export default function App() {
                   />
                 )}
                 
-                <div className="p-4 sm:p-5 border-b border-glass-border flex items-center justify-between bg-glass shrink-0 pl-8 relative z-10">
+                <div className="p-3 sm:p-4 border-b border-glass-border flex items-center justify-between bg-glass shrink-0 pl-6 relative z-10">
                   <div className="flex items-center gap-3">
-                    <div className="w-1 h-6 bg-accent rounded-full shadow-[0_0_10px_var(--color-accent-glow)]" />
-                    <span className="text-xs sm:text-sm uppercase font-display font-bold text-ink tracking-widest">Trợ lý AI</span>
+                    <div className="w-1 h-5 bg-accent rounded-full shadow-[0_0_10px_var(--color-accent-glow)]" />
+                    <span className="text-[10px] sm:text-xs uppercase font-display font-bold text-ink tracking-widest">AI Panel</span>
                   </div>
+
+                  {isAiPanelMinimized && (
+                    <div className="flex flex-1 items-center justify-end pr-2 overflow-x-auto custom-scrollbar">
+                      <div className="flex items-center gap-1 mx-2">
+                        <button 
+                          onClick={() => changePage(-1)}
+                          disabled={pageNumber <= 1}
+                          className="p-1.5 text-ink/40 hover:text-accent disabled:opacity-20 transition-colors shrink-0"
+                          title="Trang trước"
+                        >
+                          <ChevronLeft size={14} />
+                        </button>
+                        <button 
+                          onClick={() => seekTts(-15)}
+                          disabled={!isPlaying}
+                          className="p-1.5 text-ink/40 hover:text-accent disabled:opacity-20 transition-colors shrink-0"
+                          title="Lùi 15s"
+                        >
+                          <RotateCcw size={14} />
+                        </button>
+                        <button 
+                          onClick={() => isPlaying ? stopTts() : playTts()}
+                          disabled={isTtsLoading}
+                          className={cn(
+                            "w-8 h-8 rounded-full flex items-center justify-center transition-all shrink-0",
+                            isTtsLoading ? "bg-ink/5 cursor-wait" : (isPlaying ? "bg-accent text-paper" : "bg-ink/10 text-ink")
+                          )}
+                          title={isTtsLoading ? "Đang chuẩn bị audio..." : isPlaying ? "Tạm dừng" : "Phát"}
+                        >
+                          {isTtsLoading ? <Loader2 size={12} className="animate-spin text-accent" /> : isPlaying ? <Pause size={12} /> : <Play size={12} />}
+                        </button>
+                        <button 
+                          onClick={() => seekTts(15)}
+                          disabled={!isPlaying}
+                          className="p-1.5 text-ink/40 hover:text-accent disabled:opacity-20 transition-colors shrink-0"
+                          title="Tiến 15s"
+                        >
+                          <RotateCw size={14} />
+                        </button>
+                        <button 
+                          onClick={() => changePage(1)}
+                          disabled={pageNumber >= numPages}
+                          className="p-1.5 text-ink/40 hover:text-accent disabled:opacity-20 transition-colors shrink-0"
+                          title="Trang sau"
+                        >
+                          <ChevronRight size={14} />
+                        </button>
+                        <div className="w-[1px] h-4 bg-ink/10 mx-1 shrink-0" />
+                        <button 
+                          onClick={() => setIsContinuousReading(!isContinuousReading)}
+                          className={cn(
+                            "p-1.5 rounded-lg transition-colors shrink-0",
+                            isContinuousReading ? "text-accent bg-accent/10" : "text-ink/40 hover:text-ink/60"
+                          )}
+                          title="Đọc liên tục"
+                        >
+                          <PlayCircle size={14} />
+                        </button>
+                        <button
+                          onClick={handleDownloadAudio}
+                          disabled={(!currentTtsCacheKey || !ttsCache.current[currentTtsCacheKey]) || isAudioDownloading || isTtsLoading}
+                          className={cn(
+                            "p-1.5 rounded-lg transition-colors shrink-0 mx-1",
+                            (isTtsLoading || isAudioDownloading) ? "text-accent bg-accent/10" :
+                            (!currentTtsCacheKey || !ttsCache.current[currentTtsCacheKey]) ? "opacity-40 text-ink/20" : 
+                            "text-ink/40 hover:text-accent"
+                          )}
+                          title="Tải Audio"
+                        >
+                          {isTtsLoading || isAudioDownloading ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+                        </button>
+                        <div className="w-[1px] h-4 bg-ink/10 mx-1 shrink-0" />
+                        <button 
+                          onClick={() => setAiFontSize(prev => Math.max(12, prev - 2))}
+                          className="p-1.5 text-ink/40 hover:text-accent transition-colors font-mono shrink-0"
+                          title="Giảm cỡ chữ"
+                        >
+                          <span className="text-[10px] font-bold">A-</span>
+                        </button>
+                        <button 
+                          onClick={() => setAiFontSize(prev => Math.min(24, prev + 2))}
+                          className="p-1.5 text-ink/40 hover:text-accent transition-colors font-mono shrink-0"
+                          title="Tăng cỡ chữ"
+                        >
+                          <span className="text-[12px] font-bold">A+</span>
+                        </button>
+                        {aiMode === 'translation' && (
+                          <>
+                            <div className="w-[1px] h-4 bg-ink/10 mx-1 shrink-0" />
+                            <select
+                              value={translationStyle}
+                              onChange={(e) => {
+                                setTranslationStyle(e.target.value as any);
+                                setTimeout(() => translatePage(), 100);
+                              }}
+                              className="text-[9px] bg-transparent border-none text-ink/60 font-bold focus:ring-0 cursor-pointer outline-none shrink-0"
+                              title="Phong cách dịch"
+                            >
+                              <option value="magazine">Tạp chí</option>
+                              <option value="normal">Chuẩn</option>
+                              <option value="casual">GenZ</option>
+                            </select>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="flex items-center gap-2">
                     <button 
                       onClick={() => setIsAiPanelMinimized(!isAiPanelMinimized)} 
@@ -2147,7 +2809,7 @@ export default function App() {
                 
                 {!isAiPanelMinimized && (
                   <div className="flex-1 overflow-y-auto p-6 sm:p-8 custom-scrollbar relative z-10">
-                  {isTranslating || isSummarizing ? (
+                  {isTranslating ? (
                     <div className="flex flex-col items-center justify-center py-16 sm:py-20 gap-6 sm:gap-8">
                       <div className="relative">
                         <Loader2 size={40} className="text-accent animate-spin sm:w-12 sm:h-12" />
@@ -2158,13 +2820,14 @@ export default function App() {
                       </p>
                     </div>
                   ) : (
-                    <div className="space-y-6 sm:space-y-8">
+                    <div className="space-y-3 sm:space-y-4">
                       <div className="flex p-1 bg-glass rounded-xl border border-glass-border">
                         <button 
                           onClick={() => {
                             setAiMode('translation');
                             setAiError(null);
                             setAiSuggestion(null);
+                            setIsServedFromCache(false);
                           }}
                           className={cn(
                             "flex-1 py-2 text-[9px] uppercase font-bold tracking-widest rounded-lg transition-all duration-300",
@@ -2175,19 +2838,23 @@ export default function App() {
                         </button>
                         <button 
                           onClick={() => {
-                            setAiMode('summary');
+                            setAiMode('advanced');
                             setAiError(null);
                             setAiSuggestion(null);
+                            setIsServedFromCache(false);
                           }}
                           className={cn(
                             "flex-1 py-2 text-[9px] uppercase font-bold tracking-widest rounded-lg transition-all duration-300",
-                            aiMode === 'summary' ? "bg-accent text-paper shadow-md" : "text-ink/40 hover:text-ink/70"
+                            aiMode === 'advanced' ? "bg-accent text-paper shadow-md" : "text-ink/40 hover:text-ink/70"
                           )}
                         >
-                          Tóm tắt
+                          Dịch nâng cao
                         </button>
                         <button 
-                          onClick={() => setAiMode('reading')}
+                          onClick={() => {
+                            setAiMode('reading');
+                            setIsServedFromCache(false);
+                          }}
                           className={cn(
                             "flex-1 py-2 text-[9px] uppercase font-bold tracking-widest rounded-lg transition-all duration-300",
                             aiMode === 'reading' ? "bg-accent text-paper shadow-md" : "text-ink/40 hover:text-ink/70"
@@ -2197,38 +2864,38 @@ export default function App() {
                         </button>
                       </div>
 
-                      <div className="grid grid-cols-1 gap-4">
+                      <div className="space-y-2">
                         {aiMode === 'reading' && (
-                          <div className="space-y-3">
-                            <div className="p-4 bg-accent/5 border border-accent/10 rounded-xl flex items-center gap-3">
-                              <div className="w-8 h-8 bg-accent/10 rounded-full flex items-center justify-center text-accent">
+                          <div className="space-y-2">
+                            <div className="p-3 bg-accent/5 border border-accent/10 rounded-xl flex items-center gap-3">
+                              <div className="w-8 h-8 bg-accent/10 rounded-lg flex items-center justify-center text-accent shrink-0">
                                 <Volume2 size={16} />
                               </div>
-                              <div className="text-left">
-                                <h3 className="text-[10px] font-bold text-ink uppercase tracking-wider">Đọc gốc</h3>
-                                <p className="text-[9px] text-ink/50 italic">Nghe nội dung trực tiếp</p>
+                              <div className="text-left flex-1">
+                                <h3 className="text-[10px] font-black text-ink uppercase tracking-wider">Đọc gốc</h3>
+                                <p className="text-[9px] text-ink/50 italic font-medium">Nghe nội dung trực tiếp</p>
                               </div>
                             </div>
                             
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-1">
                               <button 
                                 onClick={() => changePage(-1)}
                                 disabled={pageNumber <= 1}
-                                className="p-2 bg-ink/5 rounded-lg hover:bg-ink/10 disabled:opacity-30 transition-all"
+                                className="p-2 bg-ink/5 rounded-lg hover:bg-ink/10 disabled:opacity-30 transition-all border border-transparent hover:border-ink/10"
                               >
                                 <ChevronLeft size={14} />
                               </button>
-                              <div className="flex-1 bg-surface border border-glass-border rounded-lg py-1.5 text-center font-mono text-[10px] font-bold">
-                                Trang {pageNumber} / {numPages}
+                              <div className="flex-1 bg-surface border border-glass-border rounded-lg py-1.5 text-center font-mono text-[10px] font-black text-accent">
+                                TRANG {pageNumber} / {numPages}
                               </div>
                               <button 
                                 onClick={() => {
-                        setAiError(null);
-                        setAiSuggestion(null);
-                        changePage(1);
-                      }}
+                                  setAiError(null);
+                                  setAiSuggestion(null);
+                                  changePage(1);
+                                }}
                                 disabled={pageNumber >= numPages}
-                                className="p-2 bg-ink/5 rounded-lg hover:bg-ink/10 disabled:opacity-30 transition-all"
+                                className="p-2 bg-ink/5 rounded-lg hover:bg-ink/10 disabled:opacity-30 transition-all border border-transparent hover:border-ink/10"
                               >
                                 <ChevronRight size={14} />
                               </button>
@@ -2237,141 +2904,229 @@ export default function App() {
                         )}
                         
                         {aiMode === 'translation' && (
-                          <div className="grid grid-cols-2 gap-3">
-                            <div className="space-y-1.5">
-                              <label className="text-[9px] uppercase font-bold text-ink/30 tracking-widest">Ngôn ngữ</label>
+                          <div className="flex bg-ink/5 p-1 rounded-xl border border-ink/5 gap-0.5">
+                            <div className="flex-1 space-y-1 p-1">
+                              <label className="text-[8px] uppercase font-bold text-ink/30 tracking-widest pl-1 hidden sm:block">Ngôn ngữ</label>
                               <CustomSelect
                                 value={targetLang}
                                 onChange={setTargetLang}
                                 options={[
-                                  { value: 'Vietnamese', label: 'Tiếng Việt' },
-                                  { value: 'English', label: 'Tiếng Anh' },
-                                  { value: 'French', label: 'Tiếng Pháp' },
-                                  { value: 'Japanese', label: 'Tiếng Nhật' },
-                                  { value: 'Korean', label: 'Tiếng Hàn' },
+                                  { value: 'Vietnamese', label: 'T.Việt' },
+                                  { value: 'English', label: 'T.Anh' },
+                                  { value: 'French', label: 'T.Pháp' },
+                                  { value: 'Japanese', label: 'T.Nhật' },
+                                  { value: 'Korean', label: 'T.Hàn' },
                                 ]}
                               />
                             </div>
-                            <div className="space-y-1.5">
-                              <label className="text-[9px] uppercase font-bold text-ink/30 tracking-widest">Phong cách</label>
+                            <div className="w-[1px] bg-ink/10 my-2" />
+                            <div className="flex-1 space-y-1 p-1">
+                              <label className="text-[8px] uppercase font-bold text-ink/30 tracking-widest pl-1 hidden sm:block">Phong cách</label>
                               <CustomSelect
                                 value={translationStyle}
                                 onChange={(val) => setTranslationStyle(val as any)}
                                 options={[
                                   { value: 'magazine', label: 'Tạp chí' },
                                   { value: 'normal', label: 'Chuẩn' },
-                                  { value: 'casual', label: 'Gần gũi' },
+                                  { value: 'casual', label: 'GenZ' },
                                 ]}
+                              />
+                            </div>
+                            <div className="w-[1px] bg-ink/10 my-2" />
+                            <div className="flex-1 space-y-1 p-1">
+                              <label className="text-[8px] uppercase font-bold text-ink/30 tracking-widest pl-1 hidden sm:block">Giọng đọc</label>
+                              <CustomSelect
+                                value={voiceId}
+                                onChange={(val) => setVoiceId(val)}
+                                options={VOICE_OPTIONS.map(v => ({ value: v.id, label: v.label }))}
                               />
                             </div>
                           </div>
                         )}
 
-                        <div className="grid grid-cols-2 gap-3">
-                          <div className="space-y-1.5">
-                            <label className="text-[9px] uppercase font-bold text-ink/30 tracking-widest">Giọng đọc</label>
-                            <CustomSelect
-                              value={voiceId}
-                              onChange={(val) => setVoiceId(val)}
-                              options={VOICE_OPTIONS.map(v => ({ value: v.id, label: v.label }))}
-                            />
+                        {aiMode !== 'translation' && aiMode !== 'advanced' && (
+                          <div className="flex bg-ink/5 p-1 rounded-xl border border-ink/5 gap-0.5">
+                            <div className="flex-1 space-y-1 p-1">
+                              <label className="text-[8px] uppercase font-bold text-ink/30 tracking-widest pl-1 hidden sm:block">Giọng đọc</label>
+                              <CustomSelect
+                                value={voiceId}
+                                onChange={(val) => setVoiceId(val)}
+                                options={VOICE_OPTIONS.map(v => ({ value: v.id, label: v.label }))}
+                              />
+                            </div>
                           </div>
-                          <div className="space-y-1.5">
-                            <label className="text-[9px] uppercase font-bold text-ink/30 tracking-widest">Tốc độ</label>
-                            <div className="flex gap-1">
-                              {[1, 1.1, 1.2, 1.5].map((rate) => (
+                        )}
+
+                        <div className="flex flex-wrap items-center justify-between gap-2 bg-ink/5 p-1.5 rounded-xl border border-ink/5">
+                          <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">
+                            {/* PDF Quality */}
+                            <div className="flex bg-paper rounded-lg p-0.5 border border-ink/5 shadow-sm">
+                              <button 
+                                onClick={() => {
+                                  setRenderQuality('fast');
+                                  localStorage.setItem('litreader_render_quality', 'fast');
+                                }}
+                                className={cn(
+                                  "px-2 py-1 text-[9px] font-black uppercase tracking-tighter rounded-md transition-all",
+                                  renderQuality === 'fast' ? "bg-accent text-paper shadow-sm" : "text-ink/30 hover:text-ink/60"
+                                )}
+                                title="Chất lượng thấp (Tải nhanh)"
+                              >
+                                Fast
+                              </button>
+                              <div className="w-[1px] bg-ink/5 mx-0.5" />
+                              <button 
+                                onClick={() => {
+                                  setRenderQuality('high');
+                                  localStorage.setItem('litreader_render_quality', 'high');
+                                }}
+                                className={cn(
+                                  "px-2 py-1 text-[9px] font-black uppercase tracking-tighter rounded-md transition-all",
+                                  renderQuality === 'high' ? "bg-accent text-paper shadow-sm" : "text-ink/30 hover:text-ink/60"
+                                )}
+                                title="Chất lượng cao"
+                              >
+                                High
+                              </button>
+                            </div>
+
+                            {/* Font Size */}
+                            <div className="flex bg-paper rounded-lg p-0.5 border border-ink/5 shadow-sm">
+                              <button 
+                                onClick={() => setAiFontSize(prev => Math.max(12, prev - 2))}
+                                className="p-1 px-[6px] text-ink/40 hover:text-ink hover:bg-ink/5 rounded-md transition-all font-mono"
+                                title="Giảm cỡ chữ"
+                              >
+                                <span className="text-[9px] font-bold">A-</span>
+                              </button>
+                              <div className="w-[1px] bg-ink/5 mx-0.5" />
+                              <button 
+                                onClick={() => setAiFontSize(prev => Math.min(24, prev + 2))}
+                                className="p-1 px-[6px] text-ink/40 hover:text-ink hover:bg-ink/5 rounded-md transition-all font-mono"
+                                title="Tăng cỡ chữ"
+                              >
+                                <span className="text-[11px] font-bold">A+</span>
+                              </button>
+                            </div>
+
+                            {/* Speed */}
+                            <div className="flex items-center gap-0.5 bg-paper rounded-lg p-0.5 border border-ink/5 shadow-sm flex-1 sm:flex-none">
+                              <Gauge size={12} className="text-ink/30 ml-1.5 mr-0.5 hidden sm:block shrink-0" />
+                              {[1.1, 1.2, 1.25, 1.3, 1.35].map((rate) => (
                                 <button
                                   key={rate}
                                   onClick={() => setPlaybackRate(rate)}
                                   className={cn(
-                                    "flex-1 py-1.5 rounded-lg text-[9px] font-bold transition-all border",
+                                    "flex-1 sm:flex-none px-1.5 py-1 rounded-md text-[9px] font-bold transition-all flex items-center justify-center min-w-[24px]",
                                     playbackRate === rate 
-                                      ? "bg-accent text-paper border-accent shadow-sm" 
-                                      : "bg-ink/5 text-ink/60 border-ink/5 hover:bg-ink/10"
+                                      ? "bg-accent text-paper shadow-sm" 
+                                      : "text-ink/50 hover:bg-ink/5 text-ink/70"
                                   )}
                                 >
                                   {rate}x
                                 </button>
                               ))}
                             </div>
-                          </div>
-                        </div>
-                      </div>
 
-                      <div className="flex flex-col gap-4 pt-6 border-t border-ink/5">
-                        {aiMode === 'reading' && (
-                          <div className="flex items-center justify-between">
-                            <div className="flex flex-col gap-0.5">
-                              <div className="flex items-center gap-2">
-                                <PlayCircle size={14} className={cn(isContinuousReading ? "text-accent" : "text-ink/30")} />
-                                <span className="text-xs font-bold text-ink/70">Đọc liên tục</span>
-                              </div>
-                              <span className="text-[10px] text-ink/30 italic ml-5">Tự động chuyển trang khi đọc xong</span>
-                            </div>
-                            <button 
+                            {/* Auto Read */}
+                            <button
+                              onClick={() => setAutoRead(!autoRead)}
+                              title="Tự động đọc khi mở trang AI"
+                              className={cn(
+                                "flex items-center justify-center p-[6px] rounded-lg transition-all border shadow-sm shrink-0",
+                                autoRead ? "bg-accent/10 border-accent/20 text-accent" : "bg-paper border-ink/5 text-ink/40 hover:bg-ink/5"
+                              )}
+                            >
+                              <PlaySquare size={14} />
+                            </button>
+
+                            {/* Continuous Reading */}
+                            <button
                               onClick={() => setIsContinuousReading(!isContinuousReading)}
+                              title="Đọc liên tục (tự chuyển trang)"
                               className={cn(
-                                "w-12 h-6 rounded-full transition-all duration-300 relative",
-                                isContinuousReading ? "bg-accent" : "bg-ink/10"
+                                "flex items-center justify-center p-[6px] rounded-lg transition-all border shadow-sm shrink-0",
+                                isContinuousReading ? "bg-accent/10 border-accent/20 text-accent" : "bg-paper border-ink/5 text-ink/40 hover:bg-ink/5"
                               )}
                             >
-                              <div className={cn(
-                                "absolute top-1 w-4 h-4 rounded-full bg-white transition-all duration-300 shadow-sm",
-                                isContinuousReading ? "right-1" : "left-1"
-                              )} />
+                              <Repeat size={14} className={cn(isContinuousReading && "animate-[spin_4s_linear_infinite_reverse]")} />
+                            </button>
+                            
+                            {/* Download Audio */}
+                            <button
+                              onClick={handleDownloadAudio}
+                              title="Tải Audio"
+                              disabled={(!currentTtsCacheKey || !ttsCache.current[currentTtsCacheKey]) || isAudioDownloading || isTtsLoading}
+                              className={cn(
+                                "flex items-center justify-center p-[6px] rounded-lg transition-all border shadow-sm shrink-0",
+                                isTtsLoading || isAudioDownloading ? "bg-accent/10 border-accent/20 text-accent" :
+                                (!currentTtsCacheKey || !ttsCache.current[currentTtsCacheKey]) ? "opacity-40 bg-paper border-ink/5 text-ink/20" : 
+                                "bg-paper border-ink/5 text-ink/60 hover:text-accent hover:border-accent/30 hover:bg-accent/5"
+                              )}
+                            >
+                              {isTtsLoading || isAudioDownloading ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
                             </button>
                           </div>
-                        )}
-                      </div>
 
-                      <div className="pt-6 border-t border-ink/5 space-y-4">
-                        <div className="flex items-center justify-between">
-                          <h4 className="text-[10px] uppercase font-bold text-ink/30 tracking-widest">
-                            {aiMode === 'translation' ? 'Bản dịch' : aiMode === 'summary' ? 'Tóm tắt' : 'Gốc'}
-                          </h4>
-                          <div className="flex items-center gap-2">
-                            <button 
-                              onClick={() => seekTts(-15)}
-                              disabled={!isPlaying}
-                              className="p-2 text-ink/40 hover:text-accent disabled:opacity-20 transition-colors"
-                              title="Lùi 15s"
-                            >
-                              <RotateCcw size={14} />
-                            </button>
-                            
-                            <button 
-                              onClick={() => {
-                        setAiError(null);
-                        setAiSuggestion(null);
-                        playTts();
-                      }}
-                              disabled={(!isTtsLoading && (aiMode === 'translation' ? !translatedText : aiMode === 'summary' ? !summaryText : !currentPageText))}
-                              className={cn(
-                                "w-10 h-10 rounded-full flex items-center justify-center transition-all active:scale-90",
-                                isPlaying ? "bg-accent text-paper shadow-lg shadow-accent/20" : "bg-ink/10 text-ink hover:bg-ink hover:text-paper"
-                              )}
-                            >
-                              {isTtsLoading ? <Loader2 size={16} className="animate-spin" /> : isPlaying ? <Pause size={16} /> : <Play size={16} />}
-                            </button>
-
-                            <button 
-                              onClick={() => seekTts(15)}
-                              disabled={!isPlaying}
-                              className="p-2 text-ink/40 hover:text-accent disabled:opacity-20 transition-colors"
-                              title="Tiến 15s"
-                            >
-                              <RotateCw size={14} />
-                            </button>
-                            
-                            {aiMode !== 'reading' && (
-                              <button 
-                                onClick={aiMode === 'translation' ? translatePage : summarizePage}
-                                className="ml-2 p-2 text-ink/40 hover:text-accent transition-colors"
-                                title="Tạo lại"
-                              >
-                                <RefreshCw size={14} />
-                              </button>
+                          {/* Playback Controls */}
+                          <div className="flex items-center gap-1.5 justify-end">
+                            {isServedFromCache && (
+                              <span className="text-[8px] uppercase font-bold bg-accent/10 text-accent px-1.5 py-1 rounded-md tracking-wider">
+                                Cached
+                              </span>
                             )}
+                            
+                            <div className="flex items-center gap-0.5 bg-paper border border-ink/10 rounded-full p-0.5 shadow-sm shrink-0">
+                              <button 
+                                onClick={() => seekTts(-15)}
+                                disabled={!isPlaying}
+                                className="p-1.5 text-ink/30 hover:text-accent disabled:opacity-10 transition-colors rounded-full hover:bg-ink/5"
+                                title="Lùi 15s"
+                              >
+                                <RotateCcw size={12} />
+                              </button>
+                              
+                              <button 
+                                onClick={() => {
+                                  if (isPlaying) {
+                                    stopTts();
+                                  } else {
+                                    setAiError(null);
+                                    setAiSuggestion(null);
+                                    playTts();
+                                  }
+                                }}
+                                disabled={isTtsLoading || (aiMode === 'translation' ? !translatedText : !currentPageText)}
+                                className={cn(
+                                  "w-7 h-7 sm:w-8 sm:h-8 rounded-full flex items-center justify-center transition-all active:scale-90 shadow-sm",
+                                  isTtsLoading ? "bg-ink/5 cursor-wait" : (isPlaying 
+                                    ? "bg-accent text-paper shadow-accent/20" 
+                                    : "bg-ink/90 text-paper hover:bg-accent hover:text-paper")
+                                )}
+                                title={isTtsLoading ? "Đang chuẩn bị audio..." : isPlaying ? "Tạm dừng" : "Nghe nội dung"}
+                              >
+                                {isTtsLoading ? <Loader2 size={14} className="animate-spin text-accent" /> : isPlaying ? <Pause size={14} /> : <Play size={14} />}
+                              </button>
+
+                              <button 
+                                onClick={() => seekTts(15)}
+                                disabled={!isPlaying}
+                                className="p-1.5 text-ink/30 hover:text-accent disabled:opacity-10 transition-colors rounded-full hover:bg-ink/5"
+                                title="Tiến 15s"
+                              >
+                                <RotateCw size={12} />
+                              </button>
+                              
+                              {aiMode !== 'reading' && aiMode !== 'advanced' && (
+                                <button 
+                                  onClick={translatePage}
+                                  className="p-[5px] text-ink/30 hover:text-accent transition-colors rounded-full hover:bg-ink/5 ml-0.5 border-l border-ink/5"
+                                  title="Tạo lại"
+                                >
+                                  <RefreshCw size={12} />
+                                </button>
+                              )}
+                            </div>
                           </div>
                         </div>
                         
@@ -2383,13 +3138,13 @@ export default function App() {
                               </div>
                               <div className="space-y-2">
                                 <p className="font-bold uppercase tracking-wider text-[10px] text-red-500/70">Thông báo lỗi</p>
-                                <div className="whitespace-pre-wrap leading-relaxed font-bold text-sm">
-                                  {aiError}
+                                <div className="markdown-body whitespace-pre-wrap leading-relaxed font-bold text-sm text-red-600 dark:text-red-400">
+                                  <Markdown>{aiError}</Markdown>
                                 </div>
                                 {aiSuggestion && (
                                   <div className="text-ink/60 dark:text-ink/40 font-normal leading-relaxed border-l-2 border-red-500/20 pl-3 py-1">
                                     <span className="font-bold text-[10px] uppercase tracking-tight block mb-1 opacity-50">Gợi ý khắc phục:</span>
-                                    {aiSuggestion}
+                                    <div className="markdown-body"><Markdown>{aiSuggestion}</Markdown></div>
                                   </div>
                                 )}
                               </div>
@@ -2400,7 +3155,6 @@ export default function App() {
                                   setAiError(null);
                                   setAiSuggestion(null);
                                   if (aiMode === 'translation') translatePage();
-                                  else if (aiMode === 'summary') summarizePage();
                                   else playTts();
                                 }}
                                 className="bg-red-500 text-white hover:bg-red-600 px-6 py-2.5 rounded-xl transition-all duration-300 font-bold shadow-lg shadow-red-500/20 active:scale-95 flex-1 sm:flex-none"
@@ -2420,22 +3174,281 @@ export default function App() {
                           </div>
                         )}
 
-                        <motion.div 
-                          key={aiMode + (aiMode === 'translation' ? translatedText : aiMode === 'summary' ? summaryText : currentPageText)}
-                          initial={{ opacity: 0, y: 10 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          transition={{ duration: 0.5, ease: "easeOut" }}
+                        <div 
                           className={cn(
-                            "bg-surface border border-glass-border rounded-2xl p-4 sm:p-6 prose prose-sm font-serif leading-relaxed text-ink/90 italic-quotes shadow-inner",
-                            isDarkMode && "prose-invert"
+                            "bg-surface border border-glass-border rounded-2xl p-4 sm:p-5 font-serif leading-relaxed text-ink/90 shadow-inner",
+                            aiMode === 'advanced' && "hidden"
                           )}
                         >
-                          {aiMode === 'translation' 
-                            ? (translatedText || <span className="italic text-ink/30">Nhấn dịch để bắt đầu...</span>) 
-                            : aiMode === 'summary'
-                            ? (summaryText || <span className="italic text-ink/30">Nhấn tóm tắt để bắt đầu...</span>)
-                            : (currentPageText || <span className="italic text-ink/30">Đang trích xuất văn bản...</span>)}
-                        </motion.div>
+                          <motion.div 
+                            key={aiMode + (aiMode === 'translation' ? translatedText : currentPageText)}
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            transition={{ duration: 0.5, ease: "easeOut" }}
+                            className="transition-all duration-300 ease-in-out markdown-wrapper"
+                            style={{ fontSize: `${aiFontSize}px` }}
+                          >
+                            {aiMode === 'translation' 
+                              ? (translatedText ? <div className="markdown-body"><Markdown>{translatedText}</Markdown></div> : <span className="italic text-ink/30 font-serif">Nhấn dịch để bắt đầu...</span>) 
+                              : (currentPageText ? <div className="markdown-body"><Markdown>{currentPageText}</Markdown></div> : <span className="italic text-ink/30 font-serif">Đang trích xuất văn bản...</span>)}
+                          </motion.div>
+                        </div>
+
+                        {/* Batch Translation UI - Only visible in Advanced mode */}
+                        {aiMode === 'advanced' && (
+                        <div className="mt-2 space-y-4">
+                          <div className="flex items-center justify-between mb-2">
+                            <h4 className="text-[10px] font-black uppercase tracking-widest text-ink/30">Dịch thuật nâng cao & Xuất bản</h4>
+                          </div>
+                          
+                          <div className="bg-ink/[0.03] p-4 rounded-2xl border border-ink/5">
+                            <div className="flex items-center justify-between mb-3">
+                              <span className="text-xs font-bold text-ink">Cấu hình Chapter</span>
+                              <div className="flex items-center gap-1.5 px-2 py-1 bg-accent/10 rounded-lg">
+                                <Sparkles size={10} className="text-accent" />
+                                <span className="text-[9px] font-black text-accent uppercase tracking-tighter">PREMIUM</span>
+                              </div>
+                            </div>
+                            
+                            <div className="space-y-4 mb-4">
+                              <div className="space-y-3">
+                                <div className="flex items-center justify-between">
+                                  <label className="text-[9px] uppercase font-black text-ink/20">Phạm vi trang ({batchRange.start} - {batchRange.end})</label>
+                                  <div className="flex gap-2">
+                                    <button 
+                                      onClick={() => setBatchRange({ start: pageNumber, end: pageNumber })}
+                                      className="text-[9px] font-bold text-accent hover:underline bg-accent/5 px-2 py-0.5 rounded"
+                                    >
+                                      Trang này
+                                    </button>
+                                    <button 
+                                      onClick={() => setBatchRange({ start: pageNumber, end: numPages })}
+                                      className="text-[9px] font-bold text-accent hover:underline bg-accent/5 px-2 py-0.5 rounded"
+                                    >
+                                      Từ trang này
+                                    </button>
+                                    <button 
+                                      onClick={() => setBatchRange({ start: 1, end: numPages })}
+                                      className="text-[9px] font-bold text-accent hover:underline bg-accent/5 px-2 py-0.5 rounded"
+                                    >
+                                      Toàn bộ
+                                    </button>
+                                  </div>
+                                </div>
+                                
+                                <div className="grid grid-cols-2 gap-3">
+                                  <div className="space-y-1">
+                                    <div className="flex items-center gap-1">
+                                      <button 
+                                        onClick={() => setBatchRange(prev => ({ ...prev, start: Math.max(1, prev.start - 1) }))}
+                                        className="w-6 h-6 flex items-center justify-center bg-paper border border-ink/10 rounded hover:bg-ink/5 text-ink/40"
+                                      >
+                                        -
+                                      </button>
+                                      <div className="relative flex-1">
+                                        <input 
+                                          type="number" 
+                                          value={batchRange.start}
+                                          onChange={(e) => setBatchRange(prev => ({ ...prev, start: Math.max(1, parseInt(e.target.value) || 1) }))}
+                                          className="w-full bg-paper border border-ink/10 rounded-lg px-2 py-1.5 text-xs font-bold focus:ring-1 focus:ring-accent outline-none text-ink text-center"
+                                        />
+                                      </div>
+                                      <button 
+                                        onClick={() => setBatchRange(prev => ({ ...prev, start: Math.min(batchRange.end, prev.start + 1) }))}
+                                        className="w-6 h-6 flex items-center justify-center bg-paper border border-ink/10 rounded hover:bg-ink/5 text-ink/40"
+                                      >
+                                        +
+                                      </button>
+                                    </div>
+                                    <span className="text-[7px] font-black text-ink/10 uppercase block text-center">BẮT ĐẦU</span>
+                                  </div>
+
+                                  <div className="space-y-1">
+                                    <div className="flex items-center gap-1">
+                                      <button 
+                                        onClick={() => setBatchRange(prev => ({ ...prev, end: Math.max(batchRange.start, prev.end - 1) }))}
+                                        className="w-6 h-6 flex items-center justify-center bg-paper border border-ink/10 rounded hover:bg-ink/5 text-ink/40"
+                                      >
+                                        -
+                                      </button>
+                                      <div className="relative flex-1">
+                                        <input 
+                                          type="number"
+                                          value={batchRange.end}
+                                          onChange={(e) => setBatchRange(prev => ({ ...prev, end: Math.min(numPages, Math.max(batchRange.start, parseInt(e.target.value) || batchRange.start)) }))}
+                                          className="w-full bg-paper border border-ink/10 rounded-lg px-2 py-1.5 text-xs font-bold focus:ring-1 focus:ring-accent outline-none text-ink text-center"
+                                        />
+                                      </div>
+                                      <button 
+                                        onClick={() => setBatchRange(prev => ({ ...prev, end: Math.min(numPages, prev.end + 1) }))}
+                                        className="w-6 h-6 flex items-center justify-center bg-paper border border-ink/10 rounded hover:bg-ink/5 text-ink/40"
+                                      >
+                                        +
+                                      </button>
+                                    </div>
+                                    <span className="text-[7px] font-black text-ink/10 uppercase block text-center">KẾT THÚC</span>
+                                  </div>
+                                </div>
+
+                                {pdfOutline && pdfOutline.length > 0 && (
+                                  <div className="space-y-1">
+                                    <label className="text-[8px] font-black text-ink/20 uppercase">Chọn nhanh theo Chương</label>
+                                    <select 
+                                      className="w-full bg-paper border border-ink/10 rounded-lg px-2 py-1.5 text-[10px] font-medium outline-none text-ink/70"
+                                      onChange={async (e) => {
+                                        const idx = parseInt(e.target.value);
+                                        if (isNaN(idx)) return;
+                                        
+                                        const item = pdfOutline[idx];
+                                        const nextItem = pdfOutline[idx + 1];
+                                        
+                                        try {
+                                          if (pdfDocRef.current) {
+                                            const startPage = await pdfDocRef.current.getPageIndex(item.dest[0]) + 1;
+                                            let endPage = numPages;
+                                            if (nextItem) {
+                                              endPage = await pdfDocRef.current.getPageIndex(nextItem.dest[0]);
+                                            }
+                                            setBatchRange({ start: startPage, end: endPage });
+                                          }
+                                        } catch (err) {
+                                          console.error("Chapter range error", err);
+                                        }
+                                      }}
+                                    >
+                                      <option value="">Chọn chương...</option>
+                                      {pdfOutline.map((item, idx) => (
+                                        <option key={idx} value={idx}>{item.title}</option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                )}
+
+                                <input 
+                                  type="range"
+                                  min={1}
+                                  max={numPages}
+                                  value={batchRange.end}
+                                  onChange={(e) => setBatchRange(prev => ({ ...prev, end: Math.max(prev.start, parseInt(e.target.value)) }))}
+                                  className="w-full accent-accent h-1 bg-ink/5 rounded-lg appearance-none cursor-pointer"
+                                />
+                              </div>
+
+                              <div>
+                                <label className="text-[9px] uppercase font-black text-ink/20 mb-1 block">Phong cách dịch</label>
+                                <div className="flex bg-paper rounded-xl p-1 border border-ink/10 gap-1">
+                                  {(['normal', 'casual', 'magazine'] as const).map((style) => (
+                                    <button
+                                      key={style}
+                                      onClick={() => setTranslationStyle(style)}
+                                      className={cn(
+                                        "flex-1 py-2 text-[9px] font-black uppercase tracking-tighter rounded-lg transition-all",
+                                        translationStyle === style ? "bg-accent text-paper shadow-sm" : "text-ink/30 hover:bg-ink/5"
+                                      )}
+                                    >
+                                      {style === 'normal' ? 'Chuẩn' : style === 'casual' ? 'Trẻ trung' : 'Tạp chí'}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
+
+                            {isBatchTranslating ? (
+                              <div className="space-y-2">
+                                <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-accent">
+                                  <span className="flex items-center gap-1.5">
+                                    <Loader2 size={10} className="animate-spin" />
+                                    Đang dịch: {batchProgress.current}/{batchProgress.total} trang
+                                  </span>
+                                  <button 
+                                    onClick={() => batchAbortRef.current?.abort()}
+                                    className="text-red-500 hover:underline"
+                                  >
+                                    Dừng
+                                  </button>
+                                </div>
+                                <div className="w-full h-1 bg-ink/10 rounded-full overflow-hidden">
+                                  <motion.div 
+                                    initial={{ width: 0 }}
+                                    animate={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }}
+                                    className="h-full bg-accent"
+                                  />
+                                </div>
+                              </div>
+                            ) : (
+                              <button 
+                                onClick={startBatchTranslation}
+                                className="w-full py-2.5 bg-accent text-paper rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-sm shadow-accent/20"
+                              >
+                                Dịch hàng loạt ({batchRange.start} - {batchRange.end})
+                              </button>
+                            )}
+
+                            <div className="mt-4 pt-4 border-t border-ink/5">
+                              {isBatchTtsing ? (
+                                <div className="space-y-2">
+                                  <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-[#FF4D4D]">
+                                    <span className="flex items-center gap-1.5">
+                                      <Loader2 size={10} className="animate-spin" />
+                                      Đang tạo Audio: {batchTtsProgress.current}/{batchTtsProgress.total} trang
+                                    </span>
+                                    <button 
+                                      onClick={() => batchAbortRef.current?.abort()}
+                                      className="text-ink/30 hover:text-red-500"
+                                    >
+                                      Hủy
+                                    </button>
+                                  </div>
+                                  <div className="w-full h-1 bg-ink/10 rounded-full overflow-hidden">
+                                    <motion.div 
+                                      initial={{ width: 0 }}
+                                      animate={{ width: `${(batchTtsProgress.current / batchTtsProgress.total) * 100}%` }}
+                                      className="h-full bg-[#FF4D4D]"
+                                    />
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="flex gap-2">
+                                  <button 
+                                    onClick={startBatchTts}
+                                    className="flex-1 py-2.5 bg-ink text-paper rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-md flex items-center justify-center gap-2"
+                                  >
+                                    <Volume2 size={12} />
+                                    Tạo {batchRange.end - batchRange.start > 0 ? 'Audiobook' : 'Audio'}
+                                  </button>
+                                  {batchRange.end - batchRange.start > 0 && (
+                                    <button 
+                                      onClick={downloadBatchAudioZip}
+                                      className="flex-1 py-2.5 bg-paper border border-ink/10 text-ink rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-sm flex items-center justify-center gap-2"
+                                    >
+                                      <Download size={12} />
+                                      Tải ZIP
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-1 gap-3">
+                            <button 
+                              onClick={handleDownloadAudio}
+                              disabled={isAudioDownloading || !translatedText}
+                              className={cn(
+                                "flex flex-col items-center justify-center gap-2 p-4 bg-paper border border-ink/10 rounded-2xl hover:border-accent/30 hover:bg-accent/5 transition-all group",
+                                (isAudioDownloading || !translatedText) && "opacity-50 pointer-events-none"
+                              )}
+                            >
+                              {isAudioDownloading ? (
+                                <Loader2 size={20} className="animate-spin text-accent" />
+                              ) : (
+                                <Volume2 size={20} className="text-ink/40 group-hover:text-accent transition-colors" />
+                              )}
+                              <span className="text-[9px] font-black uppercase tracking-widest text-ink/30 group-hover:text-accent transition-colors">Tải Audio MP3</span>
+                            </button>
+                          </div>
+                        </div>
+                        )}
                       </div>
                     </div>
                   )}
@@ -2446,25 +3459,62 @@ export default function App() {
         </AnimatePresence>
         </main>
 
+        {/* Floating Context Menu for Select-to-Translate */}
+        <AnimatePresence>
+          {selectedText && selectionPosition && (
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, y: 5 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 5 }}
+              style={{ 
+                left: selectionPosition.x, 
+                top: selectionPosition.y,
+                transform: 'translateX(-50%) translateY(-100%)'
+              }}
+              className="fixed z-[100] bg-ink text-paper px-4 py-2.5 rounded-2xl shadow-[0_10px_30px_rgba(0,0,0,0.4)] flex items-center gap-3 backdrop-blur-md border border-paper/10"
+            >
+              <button
+                onClick={() => translatePartial(selectedText)}
+                className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2 hover:text-accent transition-colors whitespace-nowrap"
+              >
+                <Sparkles size={14} className="text-accent" />
+                Dịch đoạn này
+              </button>
+              <div className="w-[1px] h-4 bg-paper/20" />
+              <button
+                onClick={() => {
+                  setSelectedText(null);
+                  setSelectionPosition(null);
+                  window.getSelection()?.removeAllRanges();
+                }}
+                className="hover:text-accent transition-colors p-0.5"
+              >
+                <X size={14} />
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Page Controls Overlay */}
         <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-2 pointer-events-none z-50">
           <button 
             onClick={() => goToPage(1)}
             disabled={pageNumber <= 1}
-            className="p-3 bg-ink/80 text-paper rounded-full shadow-xl pointer-events-auto disabled:opacity-50 hover:bg-accent transition-colors"
+            className="p-2 bg-ink/80 text-paper rounded-full shadow-lg pointer-events-auto disabled:opacity-50 hover:bg-accent transition-colors"
             title="Về trang đầu"
           >
-            <ChevronsLeft size={20} />
+            <ChevronsLeft size={18} />
           </button>
           <button 
             onClick={() => changePage(-1)}
             disabled={pageNumber <= 1}
-            className="p-4 bg-ink text-paper rounded-full shadow-xl pointer-events-auto disabled:opacity-50 hover:bg-accent transition-colors"
+            className="p-2.5 bg-ink text-paper rounded-full shadow-lg pointer-events-auto disabled:opacity-50 hover:bg-accent transition-colors"
+            title="Trang trước"
           >
-            <ChevronLeft size={24} />
+            <ChevronLeft size={20} />
           </button>
-          <div className="px-6 py-3 bg-paper/90 backdrop-blur-md rounded-full shadow-xl border border-ink/5 pointer-events-auto flex items-center gap-3">
-            <div className="flex items-center gap-1">
+          <div className="px-3 py-2 bg-paper/90 backdrop-blur-md rounded-full shadow-lg border border-ink/5 pointer-events-auto flex items-center gap-2">
+            <div className="flex items-center bg-ink/5 rounded-full px-3 py-1">
               <input 
                 type="text"
                 defaultValue={pageNumber}
@@ -2483,36 +3533,39 @@ export default function App() {
                     goToPage(val);
                   }
                 }}
-                className="w-10 bg-transparent font-mono text-sm font-bold text-center focus:outline-none focus:ring-1 focus:ring-accent/30 rounded"
+                title="Nhập số trang"
+                className="w-8 bg-transparent font-mono text-sm font-bold text-center text-ink focus:outline-none focus:text-accent rounded"
               />
-              <span className="font-mono text-sm font-bold text-ink/40">/ {numPages}</span>
+              <span className="font-mono text-sm font-bold text-ink/30 px-1">/</span>
+              <span className="font-mono text-sm font-bold text-ink/50">{numPages}</span>
             </div>
             <div className="h-4 w-[1px] bg-ink/10" />
-            <div className="flex items-center gap-1.5 text-[10px] font-mono text-ink/60">
-              <Clock size={12} className="text-accent" />
-              <span>{Math.floor((pageTimes[pageNumber] || 0) / 60)}m {(pageTimes[pageNumber] || 0) % 60}s</span>
-            </div>
-            <div className="h-4 w-[1px] bg-ink/10" />
-            <History size={14} className="text-ink/40" />
+            <button
+               onClick={toggleBookmark}
+               className={cn("p-1.5 rounded-full transition-colors mr-1", bookmarks.includes(pageNumber) ? "text-accent bg-accent/10" : "text-ink/40 hover:text-ink hover:bg-ink/5")}
+               title={bookmarks.includes(pageNumber) ? "Bỏ đánh dấu" : "Đánh dấu trang"}
+            >
+               <Bookmark size={16} fill={bookmarks.includes(pageNumber) ? "currentColor" : "none"} />
+            </button>
           </div>
           <button 
             onClick={() => changePage(1)}
             disabled={pageNumber >= numPages || (isSpreadView && pageNumber + 1 >= numPages)}
-            className="p-4 bg-ink text-paper rounded-full shadow-xl pointer-events-auto disabled:opacity-50 hover:bg-accent transition-colors"
+            className="p-2.5 bg-ink text-paper rounded-full shadow-lg pointer-events-auto disabled:opacity-50 hover:bg-accent transition-colors"
+            title="Trang sau"
           >
-            <ChevronRight size={24} />
+            <ChevronRight size={20} />
           </button>
           <button 
             onClick={() => goToPage(numPages)}
             disabled={pageNumber >= numPages || (isSpreadView && pageNumber + 1 >= numPages)}
-            className="p-3 bg-ink/80 text-paper rounded-full shadow-xl pointer-events-auto disabled:opacity-50 hover:bg-accent transition-colors"
+            className="p-2 bg-ink/80 text-paper rounded-full shadow-lg pointer-events-auto disabled:opacity-50 hover:bg-accent transition-colors"
             title="Đến trang cuối"
           >
-            <ChevronsRight size={20} />
+            <ChevronsRight size={18} />
           </button>
         </div>
-      </div>
-
+      
       {isDownloading && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-paper/80 backdrop-blur-sm">
           <div className="flex flex-col items-center gap-4">
@@ -2521,6 +3574,57 @@ export default function App() {
           </div>
         </div>
       )}
+          </>
+        )}
+      </div>
+
+        {/* Delete Confirmation Modal */}
+      <AnimatePresence>
+        {deleteConfirmId && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-ink/60 backdrop-blur-sm"
+            onClick={() => setDeleteConfirmId(null)}
+          >
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.9, opacity: 0, y: 20 }}
+              className="bg-panel border border-glass-border rounded-3xl p-8 max-w-sm w-full shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex flex-col items-center text-center gap-6">
+                <div className="w-16 h-16 bg-destructive/10 rounded-full flex items-center justify-center text-destructive">
+                  <Trash2 size={32} />
+                </div>
+                <div className="space-y-2">
+                  <h3 className="text-lg font-display font-bold text-ink">Xóa tài liệu?</h3>
+                  <p className="text-sm text-ink/60 font-serif leading-relaxed">
+                    Hành động này sẽ xóa vĩnh viễn tài liệu khỏi thư viện của bạn. Bạn có chắc chắn muốn tiếp tục?
+                  </p>
+                </div>
+                <div className="flex gap-3 w-full">
+                  <button 
+                    onClick={() => setDeleteConfirmId(null)}
+                    className="flex-1 py-3 px-4 bg-ink/5 text-ink/60 rounded-xl text-xs font-bold uppercase tracking-widest hover:bg-ink/10 transition-all"
+                  >
+                    Hủy
+                  </button>
+                  <button 
+                    onClick={() => handleDeleteFromLibrary(deleteConfirmId)}
+                    disabled={isDeleting}
+                    className="flex-1 py-3 px-4 bg-destructive text-paper rounded-xl text-xs font-bold uppercase tracking-widest hover:bg-destructive/90 transition-all shadow-lg shadow-destructive/20 flex items-center justify-center gap-2"
+                  >
+                    {isDeleting ? <Loader2 size={14} className="animate-spin" /> : "Xóa ngay"}
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
     </ErrorBoundary>
   );

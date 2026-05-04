@@ -1,5 +1,6 @@
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=Inter:wght@300;400;600&family=JetBrains+Mono:wght@400;700&display=swap');
 @import "tailwindcss";
+@plugin "@tailwindcss/typography";
 
 @theme {
   --font-display: "Space Grotesk", sans-serif;
@@ -90,7 +91,69 @@
   opacity: 0.8;
 }
 
-.custom-outline a:hover {
-  color: var(--color-accent);
-  opacity: 1;
+header {
+  @apply transition-all duration-300;
+}
+
+header h1 {
+  @apply transition-all duration-300;
+}
+
+header:hover h1 {
+  @apply text-accent;
+}
+
+.light header {
+  @apply bg-white/80;
+}
+
+.markdown-wrapper {
+  font-size: var(--ai-font-size, 14px);
+}
+
+.markdown-wrapper .markdown-body {
+  font-size: inherit;
+}
+
+.markdown-wrapper .markdown-body p,
+.markdown-wrapper .markdown-body ul,
+.markdown-wrapper .markdown-body ol {
+  font-size: 1em;
+  line-height: 1.6;
+}
+
+.markdown-wrapper .markdown-body h1 { font-size: 1.5em; }
+.markdown-wrapper .markdown-body h2 { font-size: 1.3em; }
+.markdown-wrapper .markdown-body h3 { font-size: 1.2em; }
+
+.markdown-body {
+  @apply text-ink/90;
+}
+
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {
+  @apply text-ink font-display font-bold mt-6 mb-3;
+}
+
+.markdown-body ul {
+  @apply list-disc pl-5 my-3;
+}
+
+.markdown-body ol {
+  @apply list-decimal pl-5 my-3;
+}
+
+.markdown-body p {
+  @apply my-3;
+}
+
+.markdown-body code {
+  @apply bg-ink/10 px-1.5 py-0.5 rounded font-mono text-sm;
+}
+
+.markdown-body pre {
+  @apply bg-ink/5 p-4 rounded-xl overflow-x-auto my-4 border border-ink/10;
+}
+
+.markdown-body pre code {
+  @apply bg-transparent p-0;
 }
