@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useMemo, useRef, Component, ReactNode } from 'react';
 import Markdown from 'react-markdown';
+import * as lamejs from 'lamejs';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Upload, 
@@ -199,6 +200,7 @@ export default function App() {
   });
   const [isTtsLoading, setIsTtsLoading] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiSuggestion, setAiSuggestion] = useState<string | null>(null);
   const [isServedFromCache, setIsServedFromCache] = useState(false);
@@ -218,6 +220,7 @@ export default function App() {
   const batchAbortRef = useRef<AbortController | null>(null);
   const [isBatchTtsing, setIsBatchTtsing] = useState(false);
   const [batchTtsProgress, setBatchTtsProgress] = useState({ current: 0, total: 0 });
+  const [batchTranslatedResult, setBatchTranslatedResult] = useState<{title: string, text: string, range: {start: number, end: number}} | null>(null);
   const [pdfOutline, setPdfOutline] = useState<any[] | null>(null);
   const [renderQuality, setRenderQuality] = useState<'fast' | 'high'>(() => {
     const saved = localStorage.getItem('litreader_render_quality');
@@ -412,6 +415,32 @@ export default function App() {
         const cached = await getCache(cacheKey);
         if (cached) setTranslatedText(cached);
       }
+      
+      // Collect all text and show modal if it completed partially or fully
+      let fullText = "";
+      for (let p = start; p <= end; p++) {
+        const cacheKey = `trans_${user ? user.uid : 'guest'}_${persistenceKey}_${p}_${targetLang}_${translationStyle}`;
+        const cached = await getCache(cacheKey);
+        if (cached) fullText += cached + "\n\n";
+      }
+      if (fullText.trim()) {
+        setBatchTranslatedResult({ title: `Bản dịch trang ${start} - ${end}`, text: fullText.trim(), range: { start, end } });
+      }
+    }
+  };
+
+  const openSeamlessTextForRange = async () => {
+    const { start, end } = batchRange;
+    let fullText = "";
+    for (let p = start; p <= end; p++) {
+      const cacheKey = `trans_${user ? user.uid : 'guest'}_${persistenceKey}_${p}_${targetLang}_${translationStyle}`;
+      const cached = await getCache(cacheKey);
+      if (cached) fullText += cached + "\n\n";
+    }
+    if (fullText.trim()) {
+      setBatchTranslatedResult({ title: `Bản dịch trang ${start} - ${end}`, text: fullText.trim(), range: { start, end } });
+    } else {
+      alert("Chưa có dữ liệu dịch cho các trang này.");
     }
   };
 
@@ -519,12 +548,12 @@ export default function App() {
           offset += buf.length + gapFrames;
         }
 
-        // Convert AudioBuffer to WAV
-        const wavBlob = audioBufferToWav(finalBuffer);
-        const url = URL.createObjectURL(wavBlob);
+        // Convert AudioBuffer to MP3
+        const mp3Blob = audioBufferToMp3(finalBuffer);
+        const url = URL.createObjectURL(mp3Blob);
         const link = document.createElement('a');
         link.href = url;
-        link.download = `Audiobook_${file.name.replace(/\.[^/.]+$/, "")}_Pages_${start}-${end}.wav`;
+        link.download = `Audiobook_${file.name.replace(/\.[^/.]+$/, "")}_Pages_${start}-${end}.mp3`;
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
@@ -538,153 +567,48 @@ export default function App() {
     }
   };
 
-  const downloadBatchAudioZip = async () => {
-    if (!file || isBatchTtsing) return;
-    
-    const { start, end } = batchRange;
-    const total = end - start + 1;
-    if (total <= 0) return;
-    
-    setIsBatchTtsing(true);
-    setBatchTtsProgress({ current: 0, total });
-    batchAbortRef.current = new AbortController();
-    
-    const zip = new JSZip();
-    const folder = zip.folder(`Audio_Pages_${start}_${end}`);
-    
-    try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      
-      for (let p = start; p <= end; p++) {
-        if (batchAbortRef.current?.signal.aborted) break;
-        setBatchTtsProgress(prev => ({ ...prev, current: p - start + 1 }));
-        
-        // 1. Get Text (Prefer translated, then original)
-        const transKey = `trans_${user ? user.uid : 'guest'}_${persistenceKey}_${p}_${targetLang}_${translationStyle}`;
-        let text = await getCache(transKey);
-        
-        if (!text) {
-          let pdf = pdfDocRef.current;
-          if (!pdf) {
-            const data = await file.arrayBuffer();
-            pdf = await pdfjs.getDocument({ data }).promise;
-            pdfDocRef.current = pdf;
-          }
-          const page = await pdf.getPage(p);
-          const textContent = await page.getTextContent();
-          text = textContent.items.map((item: any) => item.str).join(' ');
-        }
+  // Helper to convert AudioBuffer to MP3
+  const audioBufferToMp3 = (buffer: AudioBuffer): Blob => {
+    // @ts-ignore
+    const mp3encoder = new lamejs.Mp3Encoder(buffer.numberOfChannels, buffer.sampleRate, 128);
+    const mp3Data: Int8Array[] = [];
 
-        if (text?.trim()) {
-          const ttsKey = `tts_${user ? user.uid : 'guest'}_${persistenceKey}_${p}_${voiceId}_${playbackRate}_${targetLang}`;
-          let base64Audio = await getCache(ttsKey);
-          
-          if (!base64Audio) {
-            const ai = getGenAI();
-            const response = await ai.models.generateContent({
-              model: "gemini-3-flash-preview",
-              contents: [{ parts: [{ text }] }],
-              config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceId } } }
-              }
-            });
-            
-            base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-            if (base64Audio) {
-              await saveCache(ttsKey, base64Audio);
-            }
-          }
+    const left = buffer.getChannelData(0);
+    const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : new Float32Array(0);
 
-          if (base64Audio) {
-            const binary = atob(base64Audio);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            
-            // If speed is 1.0, we can just save the bytes as MP3 directly (assuming the source is MP3)
-            // But we already have logic to resample for speed, so let's stick to WAV for consistency in batch if speed is changed
-            // Or just save as MP3 if speed is 1.0 to save space.
-            // Actually, the API returns MP3 bytes. If we don't change speed, let's keep MP3.
-            
-            if (playbackRate === 1.0) {
-               folder?.file(`Page_${p}.mp3`, bytes);
-            } else {
-              let buffer = await ctx.decodeAudioData(bytes.buffer);
-              const newLength = Math.floor(buffer.length / playbackRate);
-              const resampledBuffer = ctx.createBuffer(buffer.numberOfChannels, newLength, buffer.sampleRate);
-              for (let c = 0; c < buffer.numberOfChannels; c++) {
-                const oldData = buffer.getChannelData(c);
-                const newData = resampledBuffer.getChannelData(c);
-                for (let j = 0; j < newLength; j++) {
-                  newData[j] = oldData[Math.floor(j * playbackRate)] || 0;
-                }
-              }
-              const wavBlob = audioBufferToWav(resampledBuffer);
-              folder?.file(`Page_${p}.wav`, wavBlob);
-            }
-          }
-        }
-        
-        await new Promise(r => setTimeout(r, 800));
+    const sampleBlockSize = 1152;
+    const leftInt16 = new Int16Array(left.length);
+    const rightInt16 = new Int16Array(right.length);
+
+    for (let i = 0; i < left.length; i++) {
+      leftInt16[i] = left[i] < 0 ? left[i] * 32768 : left[i] * 32767;
+      if (buffer.numberOfChannels > 1) {
+        rightInt16[i] = right[i] < 0 ? right[i] * 32768 : right[i] * 32767;
       }
+    }
 
-      const content = await zip.generateAsync({ type: "blob" });
-      const url = URL.createObjectURL(content);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `Batch_Audio_${file.name.replace(/\.[^/.]+$/, "")}.zip`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
+    for (let i = 0; i < leftInt16.length; i += sampleBlockSize) {
+      const leftChunk = leftInt16.subarray(i, i + sampleBlockSize);
+      let mp3buf;
       
-    } catch (error) {
-      console.error("Batch ZIP error:", error);
-      alert("Lỗi khi tạo ZIP audio. Vui lòng thử lại.");
-    } finally {
-      setIsBatchTtsing(false);
-    }
-  };
-
-  // Helper to convert AudioBuffer to WAV
-  const audioBufferToWav = (buffer: AudioBuffer) => {
-    const numOfChan = buffer.numberOfChannels,
-          length = buffer.length * numOfChan * 2 + 44,
-          bufferArr = new ArrayBuffer(length),
-          view = new DataView(bufferArr),
-          channels = [],
-          sampleRate = buffer.sampleRate;
-    let offset = 0, pos = 0;
-
-    const setUint16 = (data: number) => { view.setUint16(pos, data, true); pos += 2; };
-    const setUint32 = (data: number) => { view.setUint32(pos, data, true); pos += 4; };
-
-    setUint32(0x46464952); // "RIFF"
-    setUint32(length - 8); 
-    setUint32(0x45564157); // "WAVE"
-    setUint32(0x20746d66); // "fmt "
-    setUint32(16);
-    setUint16(1);
-    setUint16(numOfChan);
-    setUint32(sampleRate);
-    setUint32(sampleRate * 2 * numOfChan);
-    setUint16(numOfChan * 2);
-    setUint16(16);
-    setUint32(0x61746164); // "data"
-    setUint32(length - pos - 4);
-
-    for (let i = 0; i < numOfChan; i++) channels.push(buffer.getChannelData(i));
-
-    while (pos < length) {
-      for (let i = 0; i < numOfChan; i++) {
-        let sample = Math.max(-1, Math.min(1, channels[i][offset]));
-        sample = (sample < 0 ? sample * 0x8000 : sample * 0x7FFF);
-        view.setInt16(pos, sample, true);
-        pos += 2;
+      if (buffer.numberOfChannels > 1) {
+        const rightChunk = rightInt16.subarray(i, i + sampleBlockSize);
+        mp3buf = mp3encoder.encodeBuffer(leftChunk, rightChunk);
+      } else {
+        mp3buf = mp3encoder.encodeBuffer(leftChunk);
       }
-      offset++;
+      
+      if (mp3buf.length > 0) {
+        mp3Data.push(mp3buf);
+      }
     }
-    return new Blob([bufferArr], { type: 'audio/wav' });
+
+    const mp3buf = mp3encoder.flush();
+    if (mp3buf.length > 0) {
+      mp3Data.push(mp3buf);
+    }
+
+    return new Blob(mp3Data, { type: 'audio/mp3' });
   };
 
   // Helper to parse AI errors and provide user-friendly messages
@@ -957,12 +881,34 @@ export default function App() {
       }
       audioSourceRef.current = null;
     }
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
+    }
     setIsPlaying(false);
+    setIsPaused(false);
     setIsTtsLoading(false);
     currentOffsetRef.current = 0;
     playbackStartTimeRef.current = 0;
     audioBufferRef.current = null;
   }, []);
+
+  const pauseTts = useCallback(() => {
+    if (audioContextRef.current && audioContextRef.current.state === 'running') {
+      audioContextRef.current.suspend();
+      setIsPlaying(false);
+      setIsPaused(true);
+    }
+  }, []);
+
+  const resumeTts = useCallback(() => {
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
+      setIsPlaying(true);
+      setIsPaused(false);
+    } else if (!isPlaying) {
+      playTts();
+    }
+  }, [isPlaying]);
 
   const changePage = useCallback((offset: number) => {
     const step = isSpreadView ? offset * 2 : offset;
@@ -2706,7 +2652,7 @@ export default function App() {
                           <RotateCcw size={14} />
                         </button>
                         <button 
-                          onClick={() => isPlaying ? stopTts() : playTts()}
+                          onClick={() => isPlaying ? pauseTts() : resumeTts()}
                           disabled={isTtsLoading}
                           className={cn(
                             "w-8 h-8 rounded-full flex items-center justify-center transition-all shrink-0",
@@ -3089,11 +3035,11 @@ export default function App() {
                               <button 
                                 onClick={() => {
                                   if (isPlaying) {
-                                    stopTts();
+                                    pauseTts();
                                   } else {
                                     setAiError(null);
                                     setAiSuggestion(null);
-                                    playTts();
+                                    resumeTts();
                                   }
                                 }}
                                 disabled={isTtsLoading || (aiMode === 'translation' ? !translatedText : !currentPageText)}
@@ -3197,255 +3143,228 @@ export default function App() {
                         {/* Batch Translation UI - Only visible in Advanced mode */}
                         {aiMode === 'advanced' && (
                         <div className="mt-2 space-y-4">
-                          <div className="flex items-center justify-between mb-2">
-                            <h4 className="text-[10px] font-black uppercase tracking-widest text-ink/30">Dịch thuật nâng cao & Xuất bản</h4>
-                          </div>
-                          
-                          <div className="bg-ink/[0.03] p-4 rounded-2xl border border-ink/5">
-                            <div className="flex items-center justify-between mb-3">
-                              <span className="text-xs font-bold text-ink">Cấu hình Chapter</span>
-                              <div className="flex items-center gap-1.5 px-2 py-1 bg-accent/10 rounded-lg">
-                                <Sparkles size={10} className="text-accent" />
-                                <span className="text-[9px] font-black text-accent uppercase tracking-tighter">PREMIUM</span>
-                              </div>
+                          <div className="bg-surface p-4 sm:p-5 rounded-2xl border border-glass-border shadow-sm relative overflow-hidden group/batch">
+                            <div className="absolute top-0 right-0 p-4 opacity-5 group-hover/batch:opacity-10 transition-opacity pointer-events-none">
+                              <Sparkles size={120} />
                             </div>
                             
-                            <div className="space-y-4 mb-4">
-                              <div className="space-y-3">
-                                <div className="flex items-center justify-between">
-                                  <label className="text-[9px] uppercase font-black text-ink/20">Phạm vi trang ({batchRange.start} - {batchRange.end})</label>
-                                  <div className="flex gap-2">
-                                    <button 
-                                      onClick={() => setBatchRange({ start: pageNumber, end: pageNumber })}
-                                      className="text-[9px] font-bold text-accent hover:underline bg-accent/5 px-2 py-0.5 rounded"
-                                    >
-                                      Trang này
-                                    </button>
-                                    <button 
-                                      onClick={() => setBatchRange({ start: pageNumber, end: numPages })}
-                                      className="text-[9px] font-bold text-accent hover:underline bg-accent/5 px-2 py-0.5 rounded"
-                                    >
-                                      Từ trang này
-                                    </button>
-                                    <button 
-                                      onClick={() => setBatchRange({ start: 1, end: numPages })}
-                                      className="text-[9px] font-bold text-accent hover:underline bg-accent/5 px-2 py-0.5 rounded"
-                                    >
-                                      Toàn bộ
-                                    </button>
-                                  </div>
-                                </div>
-                                
-                                <div className="grid grid-cols-2 gap-3">
-                                  <div className="space-y-1">
-                                    <div className="flex items-center gap-1">
-                                      <button 
-                                        onClick={() => setBatchRange(prev => ({ ...prev, start: Math.max(1, prev.start - 1) }))}
-                                        className="w-6 h-6 flex items-center justify-center bg-paper border border-ink/10 rounded hover:bg-ink/5 text-ink/40"
-                                      >
-                                        -
-                                      </button>
-                                      <div className="relative flex-1">
-                                        <input 
-                                          type="number" 
-                                          value={batchRange.start}
-                                          onChange={(e) => setBatchRange(prev => ({ ...prev, start: Math.max(1, parseInt(e.target.value) || 1) }))}
-                                          className="w-full bg-paper border border-ink/10 rounded-lg px-2 py-1.5 text-xs font-bold focus:ring-1 focus:ring-accent outline-none text-ink text-center"
-                                        />
-                                      </div>
-                                      <button 
-                                        onClick={() => setBatchRange(prev => ({ ...prev, start: Math.min(batchRange.end, prev.start + 1) }))}
-                                        className="w-6 h-6 flex items-center justify-center bg-paper border border-ink/10 rounded hover:bg-ink/5 text-ink/40"
-                                      >
-                                        +
-                                      </button>
-                                    </div>
-                                    <span className="text-[7px] font-black text-ink/10 uppercase block text-center">BẮT ĐẦU</span>
-                                  </div>
-
-                                  <div className="space-y-1">
-                                    <div className="flex items-center gap-1">
-                                      <button 
-                                        onClick={() => setBatchRange(prev => ({ ...prev, end: Math.max(batchRange.start, prev.end - 1) }))}
-                                        className="w-6 h-6 flex items-center justify-center bg-paper border border-ink/10 rounded hover:bg-ink/5 text-ink/40"
-                                      >
-                                        -
-                                      </button>
-                                      <div className="relative flex-1">
-                                        <input 
-                                          type="number"
-                                          value={batchRange.end}
-                                          onChange={(e) => setBatchRange(prev => ({ ...prev, end: Math.min(numPages, Math.max(batchRange.start, parseInt(e.target.value) || batchRange.start)) }))}
-                                          className="w-full bg-paper border border-ink/10 rounded-lg px-2 py-1.5 text-xs font-bold focus:ring-1 focus:ring-accent outline-none text-ink text-center"
-                                        />
-                                      </div>
-                                      <button 
-                                        onClick={() => setBatchRange(prev => ({ ...prev, end: Math.min(numPages, prev.end + 1) }))}
-                                        className="w-6 h-6 flex items-center justify-center bg-paper border border-ink/10 rounded hover:bg-ink/5 text-ink/40"
-                                      >
-                                        +
-                                      </button>
-                                    </div>
-                                    <span className="text-[7px] font-black text-ink/10 uppercase block text-center">KẾT THÚC</span>
-                                  </div>
-                                </div>
-
-                                {pdfOutline && pdfOutline.length > 0 && (
-                                  <div className="space-y-1">
-                                    <label className="text-[8px] font-black text-ink/20 uppercase">Chọn nhanh theo Chương</label>
-                                    <select 
-                                      className="w-full bg-paper border border-ink/10 rounded-lg px-2 py-1.5 text-[10px] font-medium outline-none text-ink/70"
-                                      onChange={async (e) => {
-                                        const idx = parseInt(e.target.value);
-                                        if (isNaN(idx)) return;
-                                        
-                                        const item = pdfOutline[idx];
-                                        const nextItem = pdfOutline[idx + 1];
-                                        
-                                        try {
-                                          if (pdfDocRef.current) {
-                                            const startPage = await pdfDocRef.current.getPageIndex(item.dest[0]) + 1;
-                                            let endPage = numPages;
-                                            if (nextItem) {
-                                              endPage = await pdfDocRef.current.getPageIndex(nextItem.dest[0]);
-                                            }
-                                            setBatchRange({ start: startPage, end: endPage });
-                                          }
-                                        } catch (err) {
-                                          console.error("Chapter range error", err);
-                                        }
-                                      }}
-                                    >
-                                      <option value="">Chọn chương...</option>
-                                      {pdfOutline.map((item, idx) => (
-                                        <option key={idx} value={idx}>{item.title}</option>
-                                      ))}
-                                    </select>
-                                  </div>
-                                )}
-
-                                <input 
-                                  type="range"
-                                  min={1}
-                                  max={numPages}
-                                  value={batchRange.end}
-                                  onChange={(e) => setBatchRange(prev => ({ ...prev, end: Math.max(prev.start, parseInt(e.target.value)) }))}
-                                  className="w-full accent-accent h-1 bg-ink/5 rounded-lg appearance-none cursor-pointer"
-                                />
-                              </div>
-
+                            <div className="relative space-y-5">
                               <div>
-                                <label className="text-[9px] uppercase font-black text-ink/20 mb-1 block">Phong cách dịch</label>
-                                <div className="flex bg-paper rounded-xl p-1 border border-ink/10 gap-1">
-                                  {(['normal', 'casual', 'magazine'] as const).map((style) => (
-                                    <button
-                                      key={style}
-                                      onClick={() => setTranslationStyle(style)}
-                                      className={cn(
-                                        "flex-1 py-2 text-[9px] font-black uppercase tracking-tighter rounded-lg transition-all",
-                                        translationStyle === style ? "bg-accent text-paper shadow-sm" : "text-ink/30 hover:bg-ink/5"
-                                      )}
-                                    >
-                                      {style === 'normal' ? 'Chuẩn' : style === 'casual' ? 'Trẻ trung' : 'Tạp chí'}
-                                    </button>
-                                  ))}
-                                </div>
-                              </div>
-                            </div>
-
-                            {isBatchTranslating ? (
-                              <div className="space-y-2">
-                                <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-accent">
-                                  <span className="flex items-center gap-1.5">
-                                    <Loader2 size={10} className="animate-spin" />
-                                    Đang dịch: {batchProgress.current}/{batchProgress.total} trang
-                                  </span>
-                                  <button 
-                                    onClick={() => batchAbortRef.current?.abort()}
-                                    className="text-red-500 hover:underline"
-                                  >
-                                    Dừng
-                                  </button>
-                                </div>
-                                <div className="w-full h-1 bg-ink/10 rounded-full overflow-hidden">
-                                  <motion.div 
-                                    initial={{ width: 0 }}
-                                    animate={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }}
-                                    className="h-full bg-accent"
-                                  />
-                                </div>
-                              </div>
-                            ) : (
-                              <button 
-                                onClick={startBatchTranslation}
-                                className="w-full py-2.5 bg-accent text-paper rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-sm shadow-accent/20"
-                              >
-                                Dịch hàng loạt ({batchRange.start} - {batchRange.end})
-                              </button>
-                            )}
-
-                            <div className="mt-4 pt-4 border-t border-ink/5">
-                              {isBatchTtsing ? (
-                                <div className="space-y-2">
-                                  <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-[#FF4D4D]">
-                                    <span className="flex items-center gap-1.5">
-                                      <Loader2 size={10} className="animate-spin" />
-                                      Đang tạo Audio: {batchTtsProgress.current}/{batchTtsProgress.total} trang
-                                    </span>
-                                    <button 
-                                      onClick={() => batchAbortRef.current?.abort()}
-                                      className="text-ink/30 hover:text-red-500"
-                                    >
-                                      Hủy
-                                    </button>
+                                <div className="flex items-center gap-2 mb-1">
+                                  <div className="bg-accent/10 px-2 py-0.5 rounded flex items-center justify-center">
+                                    <span className="text-[9px] font-black text-accent uppercase tracking-widest">Premium</span>
                                   </div>
-                                  <div className="w-full h-1 bg-ink/10 rounded-full overflow-hidden">
-                                    <motion.div 
-                                      initial={{ width: 0 }}
-                                      animate={{ width: `${(batchTtsProgress.current / batchTtsProgress.total) * 100}%` }}
-                                      className="h-full bg-[#FF4D4D]"
+                                  <h4 className="text-sm font-bold text-ink">Công cụ Xuất bản</h4>
+                                </div>
+                                <p className="text-[11px] text-ink/60 leading-relaxed font-medium">Dịch nhiều trang sách liên tiếp, đọc văn bản thành sách nói, và tải về các tập tin PDF, MP3, TXT một cách liền mạch.</p>
+                              </div>
+                              
+                              <div className="space-y-4 pt-4 border-t border-ink/5">
+                                <div className="space-y-3">
+                                  <div className="flex items-center justify-between">
+                                    <label className="text-[10px] uppercase font-black text-ink/40 tracking-wider">Phạm vi trang ({batchRange.start} - {batchRange.end})</label>
+                                    <div className="flex gap-1.5">
+                                      <button 
+                                        onClick={() => setBatchRange({ start: pageNumber, end: pageNumber })}
+                                        className="text-[9px] font-bold text-ink/60 hover:text-accent hover:bg-accent/10 bg-ink/5 px-2 py-1 rounded transition-colors"
+                                      >
+                                        Trang này
+                                      </button>
+                                      <button 
+                                        onClick={() => setBatchRange({ start: pageNumber, end: numPages })}
+                                        className="text-[9px] font-bold text-ink/60 hover:text-accent hover:bg-accent/10 bg-ink/5 px-2 py-1 rounded transition-colors"
+                                      >
+                                        Từ trang này
+                                      </button>
+                                      <button 
+                                        onClick={() => setBatchRange({ start: 1, end: numPages })}
+                                        className="text-[9px] font-bold text-ink/60 hover:text-accent hover:bg-accent/10 bg-ink/5 px-2 py-1 rounded transition-colors"
+                                      >
+                                        Toàn bộ
+                                      </button>
+                                    </div>
+                                  </div>
+                                  
+                                  <div className="grid grid-cols-2 gap-4">
+                                    <div className="space-y-1.5">
+                                      <div className="flex items-center gap-1.5">
+                                        <button 
+                                          onClick={() => setBatchRange(prev => ({ ...prev, start: Math.max(1, prev.start - 1) }))}
+                                          className="w-8 h-8 flex items-center justify-center bg-ink/5 rounded-lg hover:bg-ink/10 text-ink/60 transition-colors focus:ring-2 focus:ring-accent/50 outline-none"
+                                        >
+                                          -
+                                        </button>
+                                        <div className="relative flex-1">
+                                          <input 
+                                            type="number" 
+                                            value={batchRange.start}
+                                            onChange={(e) => setBatchRange(prev => ({ ...prev, start: Math.max(1, parseInt(e.target.value) || 1) }))}
+                                            className="w-full bg-paper border border-ink/10 rounded-lg px-2 py-1.5 text-sm font-bold focus:ring-2 focus:ring-accent/50 outline-none text-ink text-center shadow-inner"
+                                          />
+                                        </div>
+                                        <button 
+                                          onClick={() => setBatchRange(prev => ({ ...prev, start: Math.min(batchRange.end, prev.start + 1) }))}
+                                          className="w-8 h-8 flex items-center justify-center bg-ink/5 rounded-lg hover:bg-ink/10 text-ink/60 transition-colors focus:ring-2 focus:ring-accent/50 outline-none"
+                                        >
+                                          +
+                                        </button>
+                                      </div>
+                                      <span className="text-[9px] font-bold text-ink/30 uppercase tracking-widest block text-center">Bắt đầu</span>
+                                    </div>
+
+                                    <div className="space-y-1.5">
+                                      <div className="flex items-center gap-1.5">
+                                        <button 
+                                          onClick={() => setBatchRange(prev => ({ ...prev, end: Math.max(batchRange.start, prev.end - 1) }))}
+                                          className="w-8 h-8 flex items-center justify-center bg-ink/5 rounded-lg hover:bg-ink/10 text-ink/60 transition-colors focus:ring-2 focus:ring-accent/50 outline-none"
+                                        >
+                                          -
+                                        </button>
+                                        <div className="relative flex-1">
+                                          <input 
+                                            type="number"
+                                            value={batchRange.end}
+                                            onChange={(e) => setBatchRange(prev => ({ ...prev, end: Math.min(numPages, Math.max(batchRange.start, parseInt(e.target.value) || batchRange.start)) }))}
+                                            className="w-full bg-paper border border-ink/10 rounded-lg px-2 py-1.5 text-sm font-bold focus:ring-2 focus:ring-accent/50 outline-none text-ink text-center shadow-inner"
+                                          />
+                                        </div>
+                                        <button 
+                                          onClick={() => setBatchRange(prev => ({ ...prev, end: Math.min(numPages, prev.end + 1) }))}
+                                          className="w-8 h-8 flex items-center justify-center bg-ink/5 rounded-lg hover:bg-ink/10 text-ink/60 transition-colors focus:ring-2 focus:ring-accent/50 outline-none"
+                                        >
+                                          +
+                                        </button>
+                                      </div>
+                                      <span className="text-[9px] font-bold text-ink/30 uppercase tracking-widest block text-center">Kết thúc</span>
+                                    </div>
+                                  </div>
+
+                                  <div className="pt-2">
+                                    <input 
+                                      type="range"
+                                      min={1}
+                                      max={numPages}
+                                      value={batchRange.end}
+                                      onChange={(e) => setBatchRange(prev => ({ ...prev, end: Math.max(prev.start, parseInt(e.target.value)) }))}
+                                      className="w-full accent-accent h-1.5 bg-ink/10 rounded-lg appearance-none cursor-pointer"
                                     />
                                   </div>
                                 </div>
-                              ) : (
-                                <div className="flex gap-2">
-                                  <button 
-                                    onClick={startBatchTts}
-                                    className="flex-1 py-2.5 bg-ink text-paper rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-md flex items-center justify-center gap-2"
-                                  >
-                                    <Volume2 size={12} />
-                                    Tạo {batchRange.end - batchRange.start > 0 ? 'Audiobook' : 'Audio'}
-                                  </button>
-                                  {batchRange.end - batchRange.start > 0 && (
-                                    <button 
-                                      onClick={downloadBatchAudioZip}
-                                      className="flex-1 py-2.5 bg-paper border border-ink/10 text-ink rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-sm flex items-center justify-center gap-2"
-                                    >
-                                      <Download size={12} />
-                                      Tải ZIP
-                                    </button>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          </div>
 
-                          <div className="grid grid-cols-1 gap-3">
-                            <button 
-                              onClick={handleDownloadAudio}
-                              disabled={isAudioDownloading || !translatedText}
-                              className={cn(
-                                "flex flex-col items-center justify-center gap-2 p-4 bg-paper border border-ink/10 rounded-2xl hover:border-accent/30 hover:bg-accent/5 transition-all group",
-                                (isAudioDownloading || !translatedText) && "opacity-50 pointer-events-none"
-                              )}
-                            >
-                              {isAudioDownloading ? (
-                                <Loader2 size={20} className="animate-spin text-accent" />
-                              ) : (
-                                <Volume2 size={20} className="text-ink/40 group-hover:text-accent transition-colors" />
-                              )}
-                              <span className="text-[9px] font-black uppercase tracking-widest text-ink/30 group-hover:text-accent transition-colors">Tải Audio MP3</span>
-                            </button>
+                                <div className="space-y-1.5 pt-2">
+                                  <label className="text-[10px] uppercase font-black text-ink/40 tracking-wider block">Phong cách dịch</label>
+                                  <div className="flex bg-ink/5 rounded-xl p-1 gap-1">
+                                    {(['normal', 'casual', 'magazine'] as const).map((style) => (
+                                      <button
+                                        key={style}
+                                        onClick={() => setTranslationStyle(style)}
+                                        className={cn(
+                                          "flex-1 py-2 text-[10px] font-bold uppercase tracking-wider rounded-lg transition-all",
+                                          translationStyle === style ? "bg-paper text-accent shadow-sm" : "text-ink/40 hover:bg-ink/10"
+                                        )}
+                                      >
+                                        {style === 'normal' ? 'Chuẩn' : style === 'casual' ? 'Trẻ trung' : 'Tạp chí'}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                                <div className="space-y-1.5 pt-2">
+                                  <label className="text-[10px] uppercase font-black text-ink/40 tracking-wider block">Giọng đọc (Sách nói)</label>
+                                  <CustomSelect
+                                    value={voiceId}
+                                    onChange={(val) => setVoiceId(val)}
+                                    options={VOICE_OPTIONS.map(v => ({ value: v.id, label: v.label }))}
+                                  />
+                                </div>
+                                <div className="space-y-1.5 pt-2">
+                                  <label className="text-[10px] uppercase font-black text-ink/40 tracking-wider block">Tốc độ ({playbackRate}x)</label>
+                                  <input 
+                                    type="range"
+                                    min={0.5} max={2.0} step={0.1}
+                                    value={playbackRate}
+                                    onChange={(e) => setPlaybackRate(parseFloat(e.target.value))}
+                                    className="w-full accent-accent h-1.5 bg-ink/10 rounded-lg appearance-none cursor-pointer"
+                                  />
+                                </div>
+                              </div>
+
+                              <div className="space-y-4 pt-4 border-t border-ink/5">
+                                {isBatchTranslating ? (
+                                  <div className="space-y-2 bg-accent/5 p-3 rounded-xl border border-accent/10">
+                                    <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-accent">
+                                      <span className="flex items-center gap-2">
+                                        <Loader2 size={12} className="animate-spin" />
+                                        Đang dịch: {batchProgress.current}/{batchProgress.total} trang
+                                      </span>
+                                      <button 
+                                        onClick={() => batchAbortRef.current?.abort()}
+                                        className="text-red-500 hover:text-red-600 transition-colors px-2 py-0.5 bg-red-500/10 rounded"
+                                      >
+                                        Dừng
+                                      </button>
+                                    </div>
+                                    <div className="w-full h-1.5 bg-accent/20 rounded-full overflow-hidden">
+                                      <motion.div 
+                                        initial={{ width: 0 }}
+                                        animate={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }}
+                                        className="h-full bg-accent"
+                                      />
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="flex flex-col sm:flex-row gap-2">
+                                    <button 
+                                      onClick={startBatchTranslation}
+                                      className="flex-1 py-3 bg-accent text-paper rounded-xl text-xs font-black uppercase tracking-widest hover:bg-accent/90 focus:ring-4 focus:ring-accent/20 transition-all shadow-md flex items-center justify-center gap-2"
+                                    >
+                                      <Languages size={14} />
+                                      Dịch hàng loạt ({batchRange.start}-{batchRange.end})
+                                    </button>
+                                    <button 
+                                      onClick={openSeamlessTextForRange}
+                                      className="flex-1 py-3 bg-paper text-accent border border-accent/20 rounded-xl text-xs font-black uppercase tracking-widest hover:bg-accent/5 focus:ring-4 focus:ring-accent/10 transition-all flex items-center justify-center gap-2 shadow-sm"
+                                    >
+                                      <FileText size={14} />
+                                      Xem liền mạch
+                                    </button>
+                                  </div>
+                                )}
+
+                                {isBatchTtsing ? (
+                                  <div className="space-y-2 bg-ink/5 p-3 rounded-xl border border-ink/10">
+                                    <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-[#FF4D4D]">
+                                      <span className="flex items-center gap-2">
+                                        <Loader2 size={12} className="animate-spin" />
+                                        Đang tạo Audio: {batchTtsProgress.current}/{batchTtsProgress.total} trang
+                                      </span>
+                                      <button 
+                                        onClick={() => batchAbortRef.current?.abort()}
+                                        className="text-red-500 hover:text-red-600 transition-colors px-2 py-0.5 bg-red-500/10 rounded"
+                                      >
+                                        Hủy
+                                      </button>
+                                    </div>
+                                    <div className="w-full h-1.5 bg-ink/10 rounded-full overflow-hidden">
+                                      <motion.div 
+                                        initial={{ width: 0 }}
+                                        animate={{ width: `${(batchTtsProgress.current / batchTtsProgress.total) * 100}%` }}
+                                        className="h-full bg-[#FF4D4D]"
+                                      />
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="flex flex-col sm:flex-row gap-2">
+                                    <button 
+                                      onClick={startBatchTts}
+                                      className="flex-1 py-3 bg-ink text-paper rounded-xl text-xs font-black uppercase tracking-widest hover:bg-ink/90 focus:ring-4 focus:ring-ink/20 transition-all shadow-md flex items-center justify-center gap-2"
+                                    >
+                                      <Volume2 size={14} />
+                                      Tải xuống {batchRange.end - batchRange.start > 0 ? 'Audiobook (MP3)' : 'Audio (MP3)'}
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
                           </div>
                         </div>
                         )}
@@ -3625,6 +3544,70 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+      <AnimatePresence>
+        {batchTranslatedResult && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-paper/90 backdrop-blur p-4 sm:p-8"
+          >
+            <motion.div 
+              initial={{ scale: 0.95, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 20 }}
+              className="bg-paper border border-ink/10 shadow-2xl rounded-2xl w-full max-w-4xl h-full max-h-[85vh] flex flex-col overflow-hidden"
+            >
+              <div className="flex items-center justify-between p-4 sm:p-6 border-b border-ink/10 bg-ink/5">
+                <h2 className="font-bold font-serif text-lg text-ink">{batchTranslatedResult.title}</h2>
+                <div className="flex items-center gap-2">
+                  <button 
+                    onClick={() => {
+                      const element = document.createElement("a");
+                      const file = new Blob([batchTranslatedResult.text], {type: 'text/plain'});
+                      element.href = URL.createObjectURL(file);
+                      element.download = `${batchTranslatedResult.title}.txt`;
+                      document.body.appendChild(element); // Required for this to work in FireFox
+                      element.click();
+                    }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-ink/10 hover:bg-ink/20 text-ink text-xs font-bold uppercase tracking-wider rounded-lg transition-colors"
+                  >
+                    <Download size={14} /> Tải TXT
+                  </button>
+                  <button 
+                    onClick={() => {
+                      setBatchRange(batchTranslatedResult.range);
+                      setIsSidebarOpen(true);
+                      setBatchTranslatedResult(null);
+                      startBatchTts();
+                    }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent/90 text-paper text-xs font-bold uppercase tracking-wider rounded-lg transition-colors"
+                  >
+                    <Volume2 size={14} /> Tạo Audiobook
+                  </button>
+                  <button 
+                    onClick={() => setBatchTranslatedResult(null)}
+                    className="p-1.5 bg-ink/10 hover:bg-ink/20 text-ink rounded-full transition-colors ml-2"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              </div>
+              <div className="flex-1 overflow-auto p-6 sm:p-10 bg-paper">
+                <div 
+                  className={cn("max-w-3xl mx-auto prose prose-sm sm:prose-base", fontFamily === 'font-serif' ? 'prose-headings:font-serif prose-p:font-serif' : 'prose-headings:font-sans prose-p:font-sans')}
+                  style={{ fontSize: `${aiFontSize + 2}px`, lineHeight: '1.8' }}
+                >
+                  {batchTranslatedResult.text.split('\n\n').map((paragraph, idx) => (
+                    <p key={idx} className="mb-4 text-ink/90 whitespace-pre-wrap">{paragraph}</p>
+                  ))}
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
     </div>
     </ErrorBoundary>
   );
